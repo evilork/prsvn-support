@@ -73,10 +73,12 @@ export function copyMessage(
   toChatId: number,
   fromChatId: number,
   messageId: number,
+  opts: { caption?: string; parse_mode?: 'HTML' } = {},
 ) {
   return call<{ message_id: number }>('copyMessage', {
     chat_id: toChatId,
     from_chat_id: fromChatId,
     message_id: messageId,
+    ...opts,
   });
 }

@@ -142,17 +142,42 @@ async function forwardClientToAdmins(user: TgUser, msg: TgMessage) {
       }
     }
 
-    const copy = await copyMessage(adminId, user.id, msg.message_id);
-    if (copy.ok && copy.result) {
-      await mapAdminMsgToTicket(copy.result.message_id, ticket.id);
+    const sig = `👤 ${fullName}${usernamePart} • <code>${user.id}</code> • #${ticket.id}`;
+    const asText = !!msg.text && msg.text.length <= 3900;
+    let relayed: Awaited<ReturnType<typeof sendMessage>>;
+    let needSeparateSig = false;
+    if (asText) {
+      relayed = await sendMessage(
+        adminId,
+        `${escapeHtml(msg.text!)}
+
+${sig}`,
+        { parse_mode: 'HTML' },
+      );
+    } else {
+      const cap = msg.caption
+        ? `${escapeHtml(msg.caption)}
+
+${sig}`
+        : sig;
+      relayed = await copyMessage(adminId, user.id, msg.message_id, {
+        caption: cap,
+        parse_mode: 'HTML',
+      });
+      if (!relayed.ok) {
+        relayed = await copyMessage(adminId, user.id, msg.message_id);
+        needSeparateSig = true;
+      }
+    }
+    if (relayed.ok && relayed.result) {
+      await mapAdminMsgToTicket(relayed.result.message_id, ticket.id);
       await touchTicket(ticket.id, msg.message_id);
-      const sig = `👤 ${fullName}${usernamePart} • <code>${user.id}</code> • #${ticket.id}`;
-      const sigRes = await sendMessage(adminId, sig, { parse_mode: 'HTML' });
-      if (sigRes.ok && sigRes.result) {
-        await mapAdminMsgToTicket(sigRes.result.message_id, ticket.id);
+      if (needSeparateSig) {
+        const sr = await sendMessage(adminId, sig, { parse_mode: 'HTML' });
+        if (sr.ok && sr.result) await mapAdminMsgToTicket(sr.result.message_id, ticket.id);
       }
     } else {
-      console.warn('[support] copyMessage to admin failed:', copy.description);
+      console.warn('[support] relay to admin failed:', relayed.description);
     }
   }
 }
@@ -325,8 +350,12 @@ async function handleAdminCallback(cb: TgCallbackQuery, data: string) {
       await sendMessage(chatId, 'Последнее сообщение не найдено.');
       return;
     }
-    // Re-copy the original from client chat
-    const res = await copyMessage(chatId, t.userId, t.lastUserMsgId);
+    // New tickets: lastUserMsgId is the original id in the client chat
+    let res = await copyMessage(chatId, t.userId, t.lastUserMsgId);
+    // Legacy tickets: id was the copy in the admin chat — re-copy from here
+    if (!res.ok) {
+      res = await copyMessage(chatId, chatId, t.lastUserMsgId);
+    }
     if (!res.ok) {
       // Fallback: scroll hint — TG doesn't have deep-link to msg in DM
       await sendMessage(
