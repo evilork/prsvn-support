@@ -145,7 +145,12 @@ async function forwardClientToAdmins(user: TgUser, msg: TgMessage) {
     const copy = await copyMessage(adminId, user.id, msg.message_id);
     if (copy.ok && copy.result) {
       await mapAdminMsgToTicket(copy.result.message_id, ticket.id);
-      await touchTicket(ticket.id, copy.result.message_id);
+      await touchTicket(ticket.id, msg.message_id);
+      const sig = `👤 ${fullName}${usernamePart} • <code>${user.id}</code> • #${ticket.id}`;
+      const sigRes = await sendMessage(adminId, sig, { parse_mode: 'HTML' });
+      if (sigRes.ok && sigRes.result) {
+        await mapAdminMsgToTicket(sigRes.result.message_id, ticket.id);
+      }
     } else {
       console.warn('[support] copyMessage to admin failed:', copy.description);
     }

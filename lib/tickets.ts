@@ -16,7 +16,7 @@ export interface Ticket {
   updatedAt: number;
   closedAt?: number;
   messagesCount: number;
-  lastUserMsgId?: number; // message_id of last client msg as it appears in admin chat
+  lastUserMsgId?: number; // original message_id of last client msg in the client chat (for re-copy)
 }
 
 const K = {
@@ -71,13 +71,13 @@ export async function createTicket(user: TgUser): Promise<Ticket> {
 
 export async function touchTicket(
   ticketId: number,
-  lastUserMsgIdInAdminChat?: number,
+  lastUserMsgId?: number,
 ) {
   const t = await getTicket(ticketId);
   if (!t) return;
   t.updatedAt = Date.now();
   t.messagesCount += 1;
-  if (lastUserMsgIdInAdminChat) t.lastUserMsgId = lastUserMsgIdInAdminChat;
+  if (lastUserMsgId) t.lastUserMsgId = lastUserMsgId;
   await Promise.all([
     saveTicket(t),
     redis.zadd(K.openZSet, { score: t.updatedAt, member: String(ticketId) }),
