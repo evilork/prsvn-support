@@ -28,6 +28,7 @@ const K = {
   banned: (userId: number) => `support:banned:${userId}`,
   rate: (userId: number) => `support:rate:${userId}`,
   adminMsg: (messageId: number) => `support:adminmsg:${messageId}`,
+  ticketMsgs: (id: number) => `support:ticket:${id}:msgs`,
 };
 
 async function saveTicket(t: Ticket) {
@@ -178,4 +179,18 @@ export async function ticketFromAdminMsg(
   messageId: number,
 ): Promise<number | null> {
   return (await redis.get<number>(K.adminMsg(messageId))) ?? null;
+}
+
+// ─── per-ticket client message ids (for "show all") ────────
+
+export async function addTicketMsg(ticketId: number, clientMsgId: number) {
+  const key = K.ticketMsgs(ticketId);
+  await redis.rpush(key, clientMsgId);
+  await redis.ltrim(key, -100, -1);
+  await redis.expire(key, config.ticketDataTtlSec);
+}
+
+export async function getTicketMsgs(ticketId: number): Promise<number[]> {
+  const arr = await redis.lrange<number>(K.ticketMsgs(ticketId), 0, -1);
+  return (arr || []).map((x) => Number(x)).filter((n) => Number.isFinite(n));
 }

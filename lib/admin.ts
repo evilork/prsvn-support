@@ -157,7 +157,10 @@ export async function renderTicketCard(
 
   if (t.lastUserMsgId) {
     rows.push([
-      { text: '💬 Показать последнее сообщение', callback_data: `tl:${t.id}` },
+      { text: '💬 Последнее сообщение', callback_data: `tl:${t.id}` },
+    ]);
+    rows.push([
+      { text: '📜 Показать все сообщения', callback_data: `ta:${t.id}` },
     ]);
   }
 

@@ -23,10 +23,12 @@ import {
   sendMessage,
 } from './telegram';
 import {
+  addTicketMsg,
   checkRateLimit,
   createTicket,
   getActiveTicketForUser,
   getTicket,
+  getTicketMsgs,
   isBanned,
   mapAdminMsgToTicket,
   ticketFromAdminMsg,
@@ -172,6 +174,7 @@ ${sig}`
     if (relayed.ok && relayed.result) {
       await mapAdminMsgToTicket(relayed.result.message_id, ticket.id);
       await touchTicket(ticket.id, msg.message_id);
+      await addTicketMsg(ticket.id, msg.message_id);
       if (needSeparateSig) {
         const sr = await sendMessage(adminId, sig, { parse_mode: 'HTML' });
         if (sr.ok && sr.result) await mapAdminMsgToTicket(sr.result.message_id, ticket.id);
@@ -343,6 +346,37 @@ async function handleAdminCallback(cb: TgCallbackQuery, data: string) {
     return;
   }
 
+  if (data.startsWith('ta:')) {
+    const id = parseInt(data.slice(3), 10);
+    const t = await getTicket(id);
+    if (!t) {
+      await sendMessage(chatId, 'Тикет не найден.');
+      return;
+    }
+    let ids = await getTicketMsgs(id);
+    if (ids.length === 0 && t.lastUserMsgId) ids = [t.lastUserMsgId];
+    if (ids.length === 0) {
+      await sendMessage(chatId, 'Сообщений в тикете нет.');
+      return;
+    }
+    const MAX = 20;
+    const slice = ids.slice(-MAX);
+    const more = ids.length > slice.length ? ` из ${ids.length}` : '';
+    await sendMessage(
+      chatId,
+      `📜 Сообщения тикета #${id} (${slice.length}${more}):`,
+      { parse_mode: 'HTML' },
+    );
+    for (const mid of slice) {
+      let r = await copyMessage(chatId, t.userId, mid);
+      if (!r.ok) r = await copyMessage(chatId, chatId, mid);
+      if (r.ok && r.result) {
+        await mapAdminMsgToTicket(r.result.message_id, id);
+      }
+    }
+    return;
+  }
+
   if (data.startsWith('tl:')) {
     const id = parseInt(data.slice(3), 10);
     const t = await getTicket(id);
@@ -356,7 +390,9 @@ async function handleAdminCallback(cb: TgCallbackQuery, data: string) {
     if (!res.ok) {
       res = await copyMessage(chatId, chatId, t.lastUserMsgId);
     }
-    if (!res.ok) {
+    if (res.ok && res.result) {
+      await mapAdminMsgToTicket(res.result.message_id, id);
+    } else {
       // Fallback: scroll hint — TG doesn't have deep-link to msg in DM
       await sendMessage(
         chatId,
