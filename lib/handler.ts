@@ -1,6 +1,7 @@
 // lib/handler.ts
 import {
   actionBanFromTicket,
+  actionUnbanFromTicket,
   actionCloseTicket,
   actionReopenTicket,
   renderAdminMenu,
@@ -343,6 +344,12 @@ async function handleAdminCallback(cb: TgCallbackQuery, data: string) {
   if (data.startsWith('tb:')) {
     const id = parseInt(data.slice(3), 10);
     await actionBanFromTicket(chatId, messageId, id);
+    return;
+  }
+
+  if (data.startsWith('tu:')) {
+    const id = parseInt(data.slice(3), 10);
+    await actionUnbanFromTicket(chatId, messageId, id);
     return;
   }
 

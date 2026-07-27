@@ -7,6 +7,7 @@ import {
   getTicket,
   listTickets,
   reopenTicket,
+  isBanned,
   setBanned,
   type Ticket,
 } from './tickets';
@@ -170,7 +171,12 @@ export async function renderTicketCard(
     rows.push([{ text: '🔓 Открыть заново', callback_data: `tr:${t.id}` }]);
   }
 
-  rows.push([{ text: '🚫 Заблокировать клиента', callback_data: `tb:${t.id}` }]);
+  const bannedNow = await isBanned(t.userId);
+  rows.push([
+    bannedNow
+      ? { text: '🔓 Разблокировать клиента', callback_data: `tu:${t.id}` }
+      : { text: '🚫 Заблокировать клиента', callback_data: `tb:${t.id}` },
+  ]);
 
   const backList = t.status === 'open' ? 'ao:0' : 'ac:0';
   rows.push([
@@ -216,10 +222,32 @@ export async function actionBanFromTicket(
   ticketId: number,
 ) {
   const t = await getTicket(ticketId);
-  if (!t) return;
+  if (!t) {
+    await sendMessage(adminChatId, '⚠️ Тикет не найден, блокировка не выполнена.');
+    return;
+  }
   await setBanned(t.userId, true);
   await sendMessage(adminChatId, `🚫 Клиент <code>${t.userId}</code> заблокирован.`, {
     parse_mode: 'HTML',
   });
+  await sendMessage(t.userId, 'Доступ к поддержке ограничен. Обращения больше не принимаются.');
+  await renderTicketCard(adminChatId, messageId, ticketId);
+}
+
+export async function actionUnbanFromTicket(
+  adminChatId: number,
+  messageId: number,
+  ticketId: number,
+) {
+  const t = await getTicket(ticketId);
+  if (!t) {
+    await sendMessage(adminChatId, '⚠️ Тикет не найден, разблокировка не выполнена.');
+    return;
+  }
+  await setBanned(t.userId, false);
+  await sendMessage(adminChatId, `🔓 Клиент <code>${t.userId}</code> разблокирован.`, {
+    parse_mode: 'HTML',
+  });
+  await sendMessage(t.userId, 'Доступ к поддержке восстановлен. Можете писать.');
   await renderTicketCard(adminChatId, messageId, ticketId);
 }
