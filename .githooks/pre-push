@@ -11,8 +11,12 @@ echo "🔍 Pre-push security scan..."
 
 FAIL=0
 
-# 1) Files matching .env* (except .env.example) must NOT be tracked
-TRACKED_ENV=$(git ls-files | grep -E '(^|/)\.env($|\.)' | grep -v '\.env\.example$' || true)
+# 1) Files matching .env* must NOT be tracked — кроме образцов.
+#
+# Образец это ЛЮБОЙ .env*.example, а не только `.env.example`: в проекте есть
+# и `.env.test.example`, и он законно лежит в git. Раньше исключение было
+# записано точным именем, и всякий второй образец блокировал пуш.
+TRACKED_ENV=$(git ls-files | grep -E '(^|/)\.env($|\.)' | grep -v '\.example$' || true)
 if [ -n "$TRACKED_ENV" ]; then
   echo -e "${RED}❌ Tracked .env files found (must be gitignored):${NC}"
   echo "$TRACKED_ENV"
@@ -41,8 +45,13 @@ PATTERNS=(
 for pattern in "${PATTERNS[@]}"; do
   MATCHES=$(git ls-files | xargs grep -lE "$pattern" 2>/dev/null || true)
   if [ -n "$MATCHES" ]; then
-    # Filter out .env.example (allowed to mention patterns in comments) and this hook itself
-    REAL=$(echo "$MATCHES" | grep -v -E '\.env\.example$|\.githooks/' || true)
+    # Исключается только сам хук: в нём эти образцы записаны как правила.
+    #
+    # Файлы-образцы НЕ исключаются намеренно. Раньше `.env.example` был выведен
+    # из-под проверки, то есть настоящий ключ, положенный в образец, проходил
+    # молча. Ровно так в `.env.test.example` полгода пролежал живой токен
+    # тестового бота — его поймало правило 1, а не это.
+    REAL=$(echo "$MATCHES" | grep -v -E '\.githooks/' || true)
     if [ -n "$REAL" ]; then
       echo -e "${RED}❌ Secret pattern detected: ${pattern}${NC}"
       echo "   in files:"
