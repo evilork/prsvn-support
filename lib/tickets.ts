@@ -17,6 +17,14 @@ export interface Ticket {
   closedAt?: number;
   messagesCount: number;
   lastUserMsgId?: number; // original message_id of last client msg in the client chat (for re-copy)
+  /** Тема в группе оператора, если тикет вынесен в тему. */
+  threadId?: number;
+  /** Закреплённая карточка в теме — её редактируем при обновлении. */
+  headerMsgId?: number;
+  /** Когда клиент писал в последний раз. */
+  lastClientAt?: number;
+  /** Когда оператор отвечал в последний раз. */
+  lastOperatorAt?: number;
 }
 
 const K = {
@@ -29,6 +37,7 @@ const K = {
   rate: (userId: number) => `support:rate:${userId}`,
   adminMsg: (messageId: number) => `support:adminmsg:${messageId}`,
   ticketMsgs: (id: number) => `support:ticket:${id}:msgs`,
+  thread: (threadId: number) => `support:thread:${threadId}`,
 };
 
 async function saveTicket(t: Ticket) {
@@ -70,19 +79,39 @@ export async function createTicket(user: TgUser): Promise<Ticket> {
   return t;
 }
 
+/** Клиент написал: счётчик, время, последнее сообщение. */
 export async function touchTicket(
   ticketId: number,
   lastUserMsgId?: number,
-) {
+): Promise<Ticket | null> {
   const t = await getTicket(ticketId);
-  if (!t) return;
+  if (!t) return null;
   t.updatedAt = Date.now();
+  t.lastClientAt = t.updatedAt;
   t.messagesCount += 1;
   if (lastUserMsgId) t.lastUserMsgId = lastUserMsgId;
   await Promise.all([
     saveTicket(t),
     redis.zadd(K.openZSet, { score: t.updatedAt, member: String(ticketId) }),
   ]);
+  return t;
+}
+
+/** Оператор ответил: с этого момента тикет не «ждёт ответа». */
+export async function markOperatorReply(ticketId: number): Promise<Ticket | null> {
+  const t = await getTicket(ticketId);
+  if (!t) return null;
+  t.lastOperatorAt = Date.now();
+  t.updatedAt = t.lastOperatorAt;
+  await saveTicket(t);
+  return t;
+}
+
+/** Ждёт ли тикет ответа оператора. Старые тикеты без отметок считаем ждущими. */
+export function isWaiting(t: Ticket): boolean {
+  if (t.status !== 'open') return false;
+  const client = t.lastClientAt ?? t.updatedAt;
+  return client > (t.lastOperatorAt ?? 0);
 }
 
 export async function closeTicket(ticketId: number) {
@@ -120,28 +149,54 @@ export async function reopenTicket(ticketId: number) {
 export async function listTickets(
   status: 'open' | 'closed',
   page: number,
+  pageSize: number = config.pageSize,
 ): Promise<{ tickets: Ticket[]; total: number }> {
   const zset = status === 'open' ? K.openZSet : K.closedZSet;
   const total = await redis.zcard(zset);
   if (total === 0) return { tickets: [], total: 0 };
 
-  const start = page * config.pageSize;
-  const stop = start + config.pageSize - 1;
+  const start = page * pageSize;
+  const stop = start + pageSize - 1;
   // ZREVRANGE: newest first
   const ids = await redis.zrange<string[]>(zset, start, stop, { rev: true });
   if (!ids || ids.length === 0) return { tickets: [], total };
 
+  // Одним обращением, а не по одному на тикет: панель открывается на каждый
+  // /start, и десять последовательных чтений давали заметную паузу.
+  const raws = await redis.mget<(Ticket | null)[]>(
+    ...ids.map((id) => K.ticket(parseInt(id, 10))),
+  );
   const tickets: Ticket[] = [];
-  for (const id of ids) {
-    const t = await getTicket(parseInt(id, 10));
+  (raws || []).forEach((t) => {
     if (t) tickets.push(t);
-  }
+  });
   return { tickets, total };
 }
 
 export async function countTickets(status: 'open' | 'closed'): Promise<number> {
   const zset = status === 'open' ? K.openZSet : K.closedZSet;
   return redis.zcard(zset);
+}
+
+// ─── темы в группе ─────────────────────────────────────────
+
+export async function setTicketThread(
+  ticketId: number,
+  threadId: number,
+  headerMsgId?: number,
+): Promise<void> {
+  const t = await getTicket(ticketId);
+  if (!t) return;
+  t.threadId = threadId;
+  if (headerMsgId) t.headerMsgId = headerMsgId;
+  await Promise.all([
+    saveTicket(t),
+    redis.set(K.thread(threadId), ticketId, { ex: config.ticketDataTtlSec }),
+  ]);
+}
+
+export async function ticketFromThread(threadId: number): Promise<number | null> {
+  return (await redis.get<number>(K.thread(threadId))) ?? null;
 }
 
 // ─── ban list ──────────────────────────────────────────────

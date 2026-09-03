@@ -14,10 +14,27 @@ function parseAdminIds(): number[] {
     .filter((n) => Number.isFinite(n) && n > 0);
 }
 
+/**
+ * Группа с темами, куда бот выносит тикеты.
+ *
+ * Пусто — прежний режим: всё в личке оператора, ответ через Reply. Задано —
+ * каждый тикет получает свою тему в этой группе, оператор пишет в тему как в
+ * обычный чат, бот относит написанное клиенту. Идентификатор группы бот сам
+ * подсказывает командой /id, когда его туда добавили.
+ */
+function parseGroupId(): number | null {
+  const raw = (process.env.SUPPORT_GROUP_ID || '').trim();
+  return /^-?\d+$/.test(raw) ? Number(raw) : null;
+}
+
+const groupId = parseGroupId();
+
 export const config = {
   botToken: required('SUPPORT_BOT_TOKEN'),
   webhookSecret: required('SUPPORT_BOT_WEBHOOK_SECRET'),
   adminUserIds: parseAdminIds(),
+  groupId,
+  forumMode: groupId !== null,
 
   rateLimitPerMinute: 10,
   pageSize: 10,

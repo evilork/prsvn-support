@@ -17,6 +17,19 @@ export interface TgChat {
   is_forum?: boolean;
 }
 
+export interface TgPhotoSize {
+  file_id: string;
+  width: number;
+  height: number;
+}
+
+export interface TgDocument {
+  file_id: string;
+  mime_type?: string;
+  file_size?: number;
+  file_name?: string;
+}
+
 export interface TgMessage {
   message_id: number;
   from?: TgUser;
@@ -24,9 +37,16 @@ export interface TgMessage {
   date: number;
   text?: string;
   caption?: string;
+  photo?: TgPhotoSize[];
+  document?: TgDocument;
   reply_to_message?: TgMessage;
   message_thread_id?: number;
   is_topic_message?: boolean;
+  /** Служебное сообщение о создании темы — в ленту клиенту не относится. */
+  forum_topic_created?: { name: string };
+  forum_topic_closed?: Record<string, never>;
+  forum_topic_reopened?: Record<string, never>;
+  pinned_message?: TgMessage;
 }
 
 export interface TgCallbackQuery {

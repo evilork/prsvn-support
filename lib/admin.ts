@@ -1,89 +1,98 @@
 // lib/admin.ts
+//
+// Панель оператора: меню со списком «кто ждёт», списки, карточка тикета,
+// шаблоны и действия. Карточка сама — в card.ts, тема в группе — в forum.ts.
+
+import { escapeHtml, fmtAgo, loadAccountPanel, loadAccountPanelById, renderAccountPanel } from './account';
+import { buildTicketCard, clientLabel, templatesKeyboard } from './card';
 import { config } from './config';
+import { closeTopic, refreshTopicCard, reopenTopic, topicUrl } from './forum';
 import { editMessageText, sendMessage } from './telegram';
+import { findTemplate } from './templates';
 import {
   closeTicket,
   countTickets,
   getTicket,
+  isWaiting,
   listTickets,
+  markOperatorReply,
   reopenTicket,
-  isBanned,
   setBanned,
   type Ticket,
 } from './tickets';
 import type { InlineKeyboard } from './types';
 
-function escapeHtml(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-function fmtDate(ts: number): string {
-  const d = new Date(ts);
-  const pad = (n: number) => String(n).padStart(2, '0');
-  // UTC+3 (Moscow / Crimea) — adjust if Anthropic infra runs UTC
-  const local = new Date(ts + 3 * 60 * 60 * 1000);
-  return `${pad(local.getUTCDate())}.${pad(local.getUTCMonth() + 1)} ${pad(local.getUTCHours())}:${pad(local.getUTCMinutes())}`;
-  void d;
-}
-
-function ticketLabel(t: Ticket): string {
-  const name = t.firstName + (t.lastName ? ' ' + t.lastName : '');
-  const trimmed = name.length > 20 ? name.slice(0, 19) + '…' : name;
-  return `#${t.id} • ${trimmed} • ${fmtDate(t.updatedAt)}`;
-}
-
-// ─── Main admin menu ───────────────────────────────────────
-
-export async function adminMenu(): Promise<{
-  text: string;
-  keyboard: InlineKeyboard;
-}> {
-  const [open, closed] = await Promise.all([
-    countTickets('open'),
-    countTickets('closed'),
-  ]);
-  const text = [
-    '<b>Поддержка ProxysVPN — панель оператора</b>',
-    '',
-    `📂 Открытых тикетов: <b>${open}</b>`,
-    `✅ Закрытых: <b>${closed}</b>`,
-    '',
-    'Чтобы ответить клиенту — сделайте Reply на любое его сообщение в этом чате.',
-  ].join('\n');
-
-  const keyboard: InlineKeyboard = [
-    [{ text: `📂 Открытые (${open})`, callback_data: 'ao:0' }],
-    [{ text: `✅ Закрытые (${closed})`, callback_data: 'ac:0' }],
-  ];
-  return { text, keyboard };
-}
-
-export async function showAdminMenu(adminChatId: number) {
-  const { text, keyboard } = await adminMenu();
-  await sendMessage(adminChatId, text, {
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: keyboard },
-  });
-}
-
-export async function renderAdminMenu(adminChatId: number, messageId: number) {
-  const { text, keyboard } = await adminMenu();
-  const res = await editMessageText(adminChatId, messageId, text, {
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: keyboard },
-  });
-  if (!res.ok) {
-    await sendMessage(adminChatId, text, {
+/** Показать или отредактировать: сначала пробуем править, не вышло — шлём. */
+async function show(
+  chatId: number,
+  messageId: number | null,
+  text: string,
+  keyboard: InlineKeyboard,
+  threadId?: number,
+) {
+  if (messageId) {
+    const res = await editMessageText(chatId, messageId, text, {
       parse_mode: 'HTML',
       reply_markup: { inline_keyboard: keyboard },
     });
+    if (res.ok) return;
   }
+  await sendMessage(chatId, text, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: keyboard },
+    message_thread_id: threadId,
+  });
 }
 
-// ─── Tickets list (paginated) ──────────────────────────────
+function ticketButton(t: Ticket): InlineKeyboard[number][number] {
+  const mark = isWaiting(t) ? '🔴' : t.status === 'closed' ? '✅' : '🟢';
+  const label = `${mark} #${t.id} · ${(t.firstName + (t.lastName ? ' ' + t.lastName : '')).trim().slice(0, 18)} · ${fmtAgo(t.updatedAt)}`;
+  if (config.forumMode && t.threadId) return { text: label, url: topicUrl(t.threadId) };
+  return { text: label, callback_data: `t:${t.id}` };
+}
+
+// ─── Меню ──────────────────────────────────────────────────
+
+export async function adminMenu(): Promise<{ text: string; keyboard: InlineKeyboard }> {
+  const [open, closed, recent] = await Promise.all([
+    countTickets('open'),
+    countTickets('closed'),
+    listTickets('open', 0, 8),
+  ]);
+  const waiting = recent.tickets.filter(isWaiting).length;
+
+  const lines = [
+    '<b>Поддержка ProxysVPN — панель оператора</b>',
+    '',
+    `📂 Открытых: <b>${open}</b> · 🔴 ждут ответа: <b>${waiting}</b> · ✅ закрытых: ${closed}`,
+    '',
+    config.forumMode
+      ? 'Тикеты — в темах группы. Пишите в тему как в обычный чат, бот доставит клиенту. /find — найти аккаунт.'
+      : 'Чтобы ответить клиенту — сделайте Reply на его сообщение. /find — найти аккаунт по ID или почте.',
+  ];
+
+  const keyboard: InlineKeyboard = recent.tickets.map((t) => [ticketButton(t)]);
+  keyboard.push([
+    { text: `📂 Все открытые (${open})`, callback_data: 'ao:0' },
+    { text: `✅ Закрытые (${closed})`, callback_data: 'ac:0' },
+  ]);
+  return { text: lines.join('\n'), keyboard };
+}
+
+export async function showAdminMenu(chatId: number, threadId?: number) {
+  const { text, keyboard } = await adminMenu();
+  await show(chatId, null, text, keyboard, threadId);
+}
+
+export async function renderAdminMenu(chatId: number, messageId: number) {
+  const { text, keyboard } = await adminMenu();
+  await show(chatId, messageId, text, keyboard);
+}
+
+// ─── Списки ────────────────────────────────────────────────
 
 export async function renderList(
-  adminChatId: number,
+  chatId: number,
   messageId: number,
   status: 'open' | 'closed',
   page: number,
@@ -96,158 +105,114 @@ export async function renderList(
   const text =
     total === 0
       ? `<b>${title}</b>\n\nПусто.`
-      : `<b>${title}</b>\n\nСтраница ${safePage + 1} из ${pages} • всего ${total}`;
+      : `<b>${title}</b>\n\nСтраница ${safePage + 1} из ${pages} · всего ${total}`;
 
-  const rows: InlineKeyboard = tickets.map((t) => [
-    { text: ticketLabel(t), callback_data: `t:${t.id}` },
-  ]);
-
+  const rows: InlineKeyboard = tickets.map((t) => [ticketButton(t)]);
   const navRow: InlineKeyboard[number] = [];
   const prefix = status === 'open' ? 'ao' : 'ac';
   if (safePage > 0) navRow.push({ text: '◀️', callback_data: `${prefix}:${safePage - 1}` });
   if (safePage < pages - 1) navRow.push({ text: '▶️', callback_data: `${prefix}:${safePage + 1}` });
   if (navRow.length > 0) rows.push(navRow);
-
   rows.push([{ text: '⬅️ В меню', callback_data: 'am' }]);
 
-  const res = await editMessageText(adminChatId, messageId, text, {
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: rows },
-  });
-  if (!res.ok) {
-    await sendMessage(adminChatId, text, {
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: rows },
-    });
-  }
+  await show(chatId, messageId, text, rows);
 }
 
-// ─── Single ticket card ────────────────────────────────────
+// ─── Карточка ──────────────────────────────────────────────
 
 export async function renderTicketCard(
-  adminChatId: number,
-  messageId: number,
+  chatId: number,
+  messageId: number | null,
   ticketId: number,
+  threadId?: number,
 ) {
   const t = await getTicket(ticketId);
   if (!t) {
-    await editMessageText(adminChatId, messageId, 'Тикет не найден.', {
-      reply_markup: { inline_keyboard: [[{ text: '⬅️ В меню', callback_data: 'am' }]] },
-    });
+    await show(chatId, messageId, 'Тикет не найден.', [[{ text: '⬅️ В меню', callback_data: 'am' }]], threadId);
     return;
   }
-
-  const name = escapeHtml(t.firstName) + (t.lastName ? ' ' + escapeHtml(t.lastName) : '');
-  const usernamePart = t.username ? ` (@${escapeHtml(t.username)})` : '';
-  const statusBadge = t.status === 'open' ? '🟢 Открыт' : '🔴 Закрыт';
-
-  const text = [
-    `<b>🎫 Тикет #${t.id}</b>`,
-    '',
-    `👤 ${name}${usernamePart}`,
-    `🆔 <code>${t.userId}</code>`,
-    `📅 Создан: ${fmtDate(t.createdAt)}`,
-    `🔄 Обновлён: ${fmtDate(t.updatedAt)}`,
-    `📨 Сообщений: ${t.messagesCount}`,
-    `📊 ${statusBadge}`,
-    '',
-    'Чтобы ответить — Reply на любое сообщение клиента в этом чате.',
-  ].join('\n');
-
-  const rows: InlineKeyboard = [];
-
-  if (t.lastUserMsgId) {
-    rows.push([
-      { text: '💬 Последнее сообщение', callback_data: `tl:${t.id}` },
-    ]);
-    rows.push([
-      { text: '📜 Показать все сообщения', callback_data: `ta:${t.id}` },
-    ]);
-  }
-
-  if (t.status === 'open') {
-    rows.push([{ text: '✅ Закрыть тикет', callback_data: `tc:${t.id}` }]);
-  } else {
-    rows.push([{ text: '🔓 Открыть заново', callback_data: `tr:${t.id}` }]);
-  }
-
-  const bannedNow = await isBanned(t.userId);
-  rows.push([
-    bannedNow
-      ? { text: '🔓 Разблокировать клиента', callback_data: `tu:${t.id}` }
-      : { text: '🚫 Заблокировать клиента', callback_data: `tb:${t.id}` },
-  ]);
-
-  const backList = t.status === 'open' ? 'ao:0' : 'ac:0';
-  rows.push([
-    { text: '⬅️ К списку', callback_data: backList },
-    { text: '🏠 В меню', callback_data: 'am' },
-  ]);
-
-  const res = await editMessageText(adminChatId, messageId, text, {
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: rows },
-  });
-  if (!res.ok) {
-    await sendMessage(adminChatId, text, {
-      parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: rows },
-    });
-  }
+  const card = await buildTicketCard(t);
+  await show(chatId, messageId, card.text, card.keyboard, threadId);
 }
 
-// ─── Actions invoked from ticket card ──────────────────────
-
-export async function actionCloseTicket(
-  adminChatId: number,
-  messageId: number,
-  ticketId: number,
-) {
-  await closeTicket(ticketId);
-  await renderTicketCard(adminChatId, messageId, ticketId);
-}
-
-export async function actionReopenTicket(
-  adminChatId: number,
-  messageId: number,
-  ticketId: number,
-) {
-  await reopenTicket(ticketId);
-  await renderTicketCard(adminChatId, messageId, ticketId);
-}
-
-export async function actionBanFromTicket(
-  adminChatId: number,
-  messageId: number,
-  ticketId: number,
-) {
+export async function renderTemplates(chatId: number, messageId: number, ticketId: number) {
   const t = await getTicket(ticketId);
   if (!t) {
-    await sendMessage(adminChatId, '⚠️ Тикет не найден, блокировка не выполнена.');
+    await show(chatId, messageId, 'Тикет не найден.', [[{ text: '⬅️ В меню', callback_data: 'am' }]]);
     return;
   }
+  const text = `📋 <b>Шаблон для #${t.id}</b> · ${clientLabel(t, false)}\n\nНажмите — текст сразу уйдёт клиенту.`;
+  await show(chatId, messageId, text, templatesKeyboard(ticketId));
+}
+
+/** Отправить шаблон клиенту. Возвращает текст для всплывашки. */
+export async function actionSendTemplate(ticketId: number, key: string): Promise<string> {
+  const [t, tpl] = [await getTicket(ticketId), findTemplate(key)];
+  if (!t) return 'Тикет не найден';
+  if (!tpl) return 'Шаблон не найден';
+  const res = await sendMessage(t.userId, tpl.text);
+  if (!res.ok) return `Не отправлено: ${res.description || 'ошибка'}`;
+  const fresh = (await markOperatorReply(ticketId)) ?? t;
+  if (t.status === 'closed') await reopenTicket(ticketId);
+  if (config.forumMode) {
+    const { noteInTopic, syncTopicName } = await import('./forum');
+    await noteInTopic(fresh, `✉️ Шаблон «${escapeHtml(tpl.title)}» отправлен клиенту:\n<i>${escapeHtml(tpl.text)}</i>`);
+    await syncTopicName(fresh);
+  }
+  return `Отправлено: ${tpl.title}`;
+}
+
+// ─── Действия ──────────────────────────────────────────────
+
+export async function actionCloseTicket(chatId: number, messageId: number, ticketId: number) {
+  const t = await closeTicket(ticketId);
+  if (t) await closeTopic(t);
+  await renderTicketCard(chatId, messageId, ticketId);
+}
+
+export async function actionReopenTicket(chatId: number, messageId: number, ticketId: number) {
+  const t = await reopenTicket(ticketId);
+  if (t) await reopenTopic(t);
+  await renderTicketCard(chatId, messageId, ticketId);
+}
+
+export async function actionBanFromTicket(chatId: number, messageId: number, ticketId: number) {
+  const t = await getTicket(ticketId);
+  if (!t) return;
   await setBanned(t.userId, true);
-  await sendMessage(adminChatId, `🚫 Клиент <code>${t.userId}</code> заблокирован.`, {
-    parse_mode: 'HTML',
-  });
-  await sendMessage(t.userId, 'Доступ к поддержке ограничен. Обращения больше не принимаются.');
-  await renderTicketCard(adminChatId, messageId, ticketId);
+  await renderTicketCard(chatId, messageId, ticketId);
 }
 
-export async function actionUnbanFromTicket(
-  adminChatId: number,
-  messageId: number,
-  ticketId: number,
-) {
+export async function actionUnbanFromTicket(chatId: number, messageId: number, ticketId: number) {
   const t = await getTicket(ticketId);
-  if (!t) {
-    await sendMessage(adminChatId, '⚠️ Тикет не найден, разблокировка не выполнена.');
-    return;
-  }
+  if (!t) return;
   await setBanned(t.userId, false);
-  await sendMessage(adminChatId, `🔓 Клиент <code>${t.userId}</code> разблокирован.`, {
-    parse_mode: 'HTML',
-  });
-  await sendMessage(t.userId, 'Доступ к поддержке восстановлен. Можете писать.');
-  await renderTicketCard(adminChatId, messageId, ticketId);
+  await renderTicketCard(chatId, messageId, ticketId);
+}
+
+/** Обновить карточку и там, где она закреплена в теме. */
+export async function actionRefreshCard(chatId: number, messageId: number, ticketId: number) {
+  const t = await getTicket(ticketId);
+  if (t && config.forumMode && t.headerMsgId && t.headerMsgId !== messageId) {
+    await refreshTopicCard(t);
+  }
+  await renderTicketCard(chatId, messageId, ticketId);
+}
+
+// ─── Поиск аккаунта ────────────────────────────────────────
+
+/**
+ * /find 6123153890 · /find user@mail.ru · /find em_user@mail.ru · /find tg_…
+ *
+ * По имени в Telegram искать нельзя: указателя «имя → аккаунт» в базе нет.
+ */
+export async function findAccountText(query: string): Promise<string> {
+  const q = query.trim();
+  if (!q) return 'Укажите ID Telegram, почту или идентификатор аккаунта: /find 6123153890';
+  let panel;
+  if (/^\d{5,}$/.test(q)) panel = await loadAccountPanel(Number(q));
+  else if (/^(tg_|em_)/.test(q)) panel = await loadAccountPanelById(q);
+  else if (q.includes('@') && q.includes('.')) panel = await loadAccountPanelById(`em_${q.toLowerCase()}`);
+  else return 'По имени искать нельзя — нужен ID Telegram (цифры), почта или tg_…/em_….';
+  return `🔎 <b>${escapeHtml(q)}</b> → <code>${escapeHtml(panel.accountId)}</code>\n\n${renderAccountPanel(panel)}`;
 }
