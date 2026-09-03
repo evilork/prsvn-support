@@ -6,6 +6,8 @@ import type { Update } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+// Массовое закрытие тихих тикетов делает по два обращения к базе на тикет.
+export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   const secret = req.headers.get('x-telegram-bot-api-secret-token');

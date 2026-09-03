@@ -103,8 +103,33 @@ export async function markOperatorReply(ticketId: number): Promise<Ticket | null
   if (!t) return null;
   t.lastOperatorAt = Date.now();
   t.updatedAt = t.lastOperatorAt;
-  await saveTicket(t);
+  await Promise.all([
+    saveTicket(t),
+    // Ответ оператора — тоже активность: иначе тикет, где последним писал
+    // оператор, через неделю попал бы под массовое закрытие «тихих».
+    t.status === 'open'
+      ? redis.zadd(K.openZSet, { score: t.updatedAt, member: String(ticketId) })
+      : Promise.resolve(null),
+  ]);
   return t;
+}
+
+// ─── тихие тикеты ──────────────────────────────────────────
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Открытые тикеты без активности дольше `days` дней. Счёт по оценке в ZSET. */
+export async function countStaleOpen(days: number, now = Date.now()): Promise<number> {
+  return redis.zcount(K.openZSet, 0, now - days * DAY_MS);
+}
+
+export async function listStaleOpenIds(days: number, now = Date.now(), limit = 500): Promise<number[]> {
+  const ids = await redis.zrange<string[]>(K.openZSet, 0, now - days * DAY_MS, {
+    byScore: true,
+    offset: 0,
+    count: limit,
+  });
+  return (ids || []).map((x) => parseInt(String(x), 10)).filter((n) => Number.isFinite(n));
 }
 
 /** Ждёт ли тикет ответа оператора. Старые тикеты без отметок считаем ждущими. */

@@ -11,9 +11,11 @@ import { editMessageText, sendMessage } from './telegram';
 import { findTemplate } from './templates';
 import {
   closeTicket,
+  countStaleOpen,
   countTickets,
   getTicket,
   isWaiting,
+  listStaleOpenIds,
   listTickets,
   markOperatorReply,
   reopenTicket,
@@ -53,11 +55,15 @@ function ticketButton(t: Ticket): InlineKeyboard[number][number] {
 
 // ─── Меню ──────────────────────────────────────────────────
 
-export async function adminMenu(): Promise<{ text: string; keyboard: InlineKeyboard }> {
-  const [open, closed, recent] = await Promise.all([
+/** Сколько дней тишины делают открытый тикет «тихим» для массового закрытия. */
+export const STALE_DAYS = 7;
+
+export async function adminMenu(note?: string): Promise<{ text: string; keyboard: InlineKeyboard }> {
+  const [open, closed, recent, stale] = await Promise.all([
     countTickets('open'),
     countTickets('closed'),
     listTickets('open', 0, 8),
+    countStaleOpen(STALE_DAYS),
   ]);
   const waiting = recent.tickets.filter(isWaiting).length;
 
@@ -71,11 +77,16 @@ export async function adminMenu(): Promise<{ text: string; keyboard: InlineKeybo
       : 'Чтобы ответить клиенту — сделайте Reply на его сообщение. /find — найти аккаунт по ID или почте.',
   ];
 
+  if (note) lines.push('', note);
+
   const keyboard: InlineKeyboard = recent.tickets.map((t) => [ticketButton(t)]);
   keyboard.push([
     { text: `📂 Все открытые (${open})`, callback_data: 'ao:0' },
     { text: `✅ Закрытые (${closed})`, callback_data: 'ac:0' },
   ]);
+  if (stale > 0) {
+    keyboard.push([{ text: `🧹 Закрыть тихие ${STALE_DAYS}+ дней (${stale})`, callback_data: `tz:${STALE_DAYS}` }]);
+  }
   return { text: lines.join('\n'), keyboard };
 }
 
@@ -84,9 +95,45 @@ export async function showAdminMenu(chatId: number, threadId?: number) {
   await show(chatId, null, text, keyboard, threadId);
 }
 
-export async function renderAdminMenu(chatId: number, messageId: number) {
-  const { text, keyboard } = await adminMenu();
+export async function renderAdminMenu(chatId: number, messageId: number, note?: string) {
+  const { text, keyboard } = await adminMenu(note);
   await show(chatId, messageId, text, keyboard);
+}
+
+// ─── Массовое закрытие тихих тикетов ───────────────────────
+
+/**
+ * Подтверждение перед закрытием: сотня тикетов одним нажатием — не то
+ * действие, которое стоит делать промахом мимо соседней кнопки.
+ */
+export async function renderStaleConfirm(chatId: number, messageId: number, days: number) {
+  const n = await countStaleOpen(days);
+  if (n === 0) {
+    await renderAdminMenu(chatId, messageId, `🧹 Тихих тикетов старше ${days} дней нет.`);
+    return;
+  }
+  const text = [
+    `🧹 <b>Закрыть ${n} тикетов?</b>`,
+    '',
+    `Это открытые тикеты, в которых ни клиент, ни оператор ничего не писали больше ${days} дней.`,
+    'Клиентам ничего не отправится. Если человек напишет снова — откроется новый тикет.',
+  ].join('\n');
+  await show(chatId, messageId, text, [
+    [{ text: `✅ Да, закрыть ${n}`, callback_data: `tzy:${days}` }],
+    [{ text: '⬅️ Отмена', callback_data: 'am' }],
+  ]);
+}
+
+export async function actionCloseStale(chatId: number, messageId: number, days: number) {
+  const ids = await listStaleOpenIds(days);
+  let closed = 0;
+  for (const id of ids) {
+    const t = await closeTicket(id);
+    if (!t) continue;
+    closed += 1;
+    if (t.threadId) await closeTopic(t);
+  }
+  await renderAdminMenu(chatId, messageId, `🧹 Закрыто тикетов: <b>${closed}</b> (тише ${days} дней).`);
 }
 
 // ─── Списки ────────────────────────────────────────────────

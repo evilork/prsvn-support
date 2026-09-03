@@ -11,6 +11,7 @@
 
 import {
   actionBanFromTicket,
+  actionCloseStale,
   actionCloseTicket,
   actionRefreshCard,
   actionReopenTicket,
@@ -19,6 +20,7 @@ import {
   findAccountText,
   renderAdminMenu,
   renderList,
+  renderStaleConfirm,
   renderTemplates,
   renderTicketCard,
   showAdminMenu,
@@ -495,6 +497,14 @@ async function handleAdminCallback(cb: TgCallbackQuery, data: string) {
     case 'ac':
       await answerCallbackQuery(cb.id);
       await renderList(chatId, messageId, kind === 'ao' ? 'open' : 'closed', parseInt(a || '0', 10) || 0);
+      return;
+    case 'tz':
+      await answerCallbackQuery(cb.id);
+      await renderStaleConfirm(chatId, messageId, id || 7);
+      return;
+    case 'tzy':
+      await answerCallbackQuery(cb.id, 'Закрываю…');
+      await actionCloseStale(chatId, messageId, id || 7);
       return;
     case 't':
       await answerCallbackQuery(cb.id);
