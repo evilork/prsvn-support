@@ -38,6 +38,7 @@ const K = {
   adminMsg: (messageId: number) => `support:adminmsg:${messageId}`,
   ticketMsgs: (id: number) => `support:ticket:${id}:msgs`,
   thread: (threadId: number) => `support:thread:${threadId}`,
+  tplLock: (id: number, key: string) => `support:tpl-lock:${id}:${key}`,
 };
 
 async function saveTicket(t: Ticket) {
@@ -273,4 +274,23 @@ export async function addTicketMsg(ticketId: number, clientMsgId: number) {
 export async function getTicketMsgs(ticketId: number): Promise<number[]> {
   const arr = await redis.lrange<number>(K.ticketMsgs(ticketId), 0, -1);
   return (arr || []).map((x) => Number(x)).filter((n) => Number.isFinite(n));
+}
+
+// ─── Замок на отправку шаблона ───────────────────────────────
+
+const TEMPLATE_LOCK_TTL_SEC = 10;
+
+/**
+ * Пропустить одну отправку шаблона в тикет за TEMPLATE_LOCK_TTL_SEC секунд.
+ * Возвращает false, если такая же отправка только что прошла (двойное
+ * нажатие кнопки). Ключ снимается сам по TTL; при сбое отправки его снимает
+ * releaseTemplateSendLock, чтобы оператор мог повторить сразу.
+ */
+export async function acquireTemplateSendLock(ticketId: number, key: string): Promise<boolean> {
+  const res = await redis.set(K.tplLock(ticketId, key), 1, { nx: true, ex: TEMPLATE_LOCK_TTL_SEC });
+  return res === 'OK';
+}
+
+export async function releaseTemplateSendLock(ticketId: number, key: string): Promise<void> {
+  await redis.del(K.tplLock(ticketId, key));
 }

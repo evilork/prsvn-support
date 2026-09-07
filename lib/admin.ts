@@ -2,6 +2,11 @@
 //
 // Панель оператора: меню со списком «кто ждёт», списки, карточка тикета,
 // шаблоны и действия. Карточка сама — в card.ts, тема в группе — в forum.ts.
+//
+// Шаблоны уходят клиенту в два шага: нажатие на шаблон открывает предпросмотр
+// текста (renderTemplatePreview), и только кнопка «✅ Отправить клиенту»
+// вызывает actionSendTemplate. Пока оператор смотрит предпросмотр, клиенту
+// ничего не отправляется.
 
 import { escapeHtml, fmtAgo, loadAccountPanel, loadAccountPanelById, renderAccountPanel } from './account';
 import { buildTicketCard, clientLabel, templatesKeyboard } from './card';
@@ -10,6 +15,7 @@ import { closeTopic, refreshTopicCard, reopenTopic, topicUrl } from './forum';
 import { editMessageText, sendMessage } from './telegram';
 import { findTemplate } from './templates';
 import {
+  acquireTemplateSendLock,
   closeTicket,
   countStaleOpen,
   countTickets,
@@ -18,6 +24,7 @@ import {
   listStaleOpenIds,
   listTickets,
   markOperatorReply,
+  releaseTemplateSendLock,
   reopenTicket,
   setBanned,
   type Ticket,
@@ -38,6 +45,9 @@ async function show(
       reply_markup: { inline_keyboard: keyboard },
     });
     if (res.ok) return;
+    // Повторное нажатие той же кнопки: Telegram отвечает «message is not
+    // modified». Экран уже такой, слать второе сообщение не надо.
+    if (/message is not modified/i.test(res.description ?? '')) return;
   }
   await sendMessage(chatId, text, {
     parse_mode: 'HTML',
@@ -182,25 +192,83 @@ export async function renderTicketCard(
   await show(chatId, messageId, card.text, card.keyboard, threadId);
 }
 
-export async function renderTemplates(chatId: number, messageId: number, ticketId: number) {
+export async function renderTemplates(chatId: number, messageId: number, ticketId: number, threadId?: number) {
   const t = await getTicket(ticketId);
   if (!t) {
-    await show(chatId, messageId, 'Тикет не найден.', [[{ text: '⬅️ В меню', callback_data: 'am' }]]);
+    await show(chatId, messageId, 'Тикет не найден.', [[{ text: '⬅️ В меню', callback_data: 'am' }]], threadId);
     return;
   }
-  const text = `📋 <b>Шаблон для #${t.id}</b> · ${clientLabel(t, false)}\n\nНажмите — текст сразу уйдёт клиенту.`;
-  await show(chatId, messageId, text, templatesKeyboard(ticketId));
+  const text = `📋 <b>Шаблон для #${t.id}</b> · ${clientLabel(t, false)}\n\nНажмите шаблон: сначала покажу текст, отправка отдельной кнопкой.`;
+  await show(chatId, messageId, text, templatesKeyboard(ticketId), threadId);
 }
 
-/** Отправить шаблон клиенту. Возвращает текст для всплывашки. */
+/**
+ * Предпросмотр шаблона перед отправкой: тот же текст, что уйдёт клиенту, в
+ * цитате, и отдельная кнопка отправки. Правит то же сообщение, где была
+ * клавиатура шаблонов. Клиенту на этом шаге ничего не уходит.
+ */
+export async function renderTemplatePreview(
+  chatId: number,
+  messageId: number,
+  ticketId: number,
+  key: string,
+  threadId?: number,
+) {
+  const t = await getTicket(ticketId);
+  if (!t) {
+    await show(chatId, messageId, 'Тикет не найден.', [[{ text: '⬅️ В меню', callback_data: 'am' }]], threadId);
+    return;
+  }
+  const tpl = findTemplate(key);
+  if (!tpl) {
+    await show(chatId, messageId, 'Шаблон не найден.', [[{ text: '⬅️ К шаблонам', callback_data: `tp:${t.id}` }]], threadId);
+    return;
+  }
+  const text = [
+    `📋 <b>Предпросмотр</b> · шаблон «${escapeHtml(tpl.title)}» → #${t.id} · ${clientLabel(t, false)}`,
+    '',
+    `<blockquote>${escapeHtml(tpl.text)}</blockquote>`,
+    '',
+    'Клиенту пока ничего не ушло. Отправится только по кнопке ниже.',
+  ].join('\n');
+  const keyboard: InlineKeyboard = [
+    [{ text: '✅ Отправить клиенту', callback_data: `tps:${t.id}:${tpl.key}` }],
+    [
+      { text: '⬅️ Другой шаблон', callback_data: `tp:${t.id}` },
+      { text: '✖️ К карточке', callback_data: `tk:${t.id}` },
+    ],
+  ];
+  await show(chatId, messageId, text, keyboard, threadId);
+}
+
+/**
+ * Отправить шаблон клиенту. Возвращает текст для всплывашки.
+ *
+ * Два быстрых нажатия «✅ Отправить клиенту» приходят двумя callback до того,
+ * как экран перерисуется в карточку; без замка клиент получил бы текст дважды.
+ * Замок в базе на несколько секунд пропускает первое нажатие, второму отвечаем
+ * «Уже отправлено». Закрытый тикет открываем заново вместе с темой, чтобы
+ * заметка и имя темы считались по уже открытому состоянию.
+ */
 export async function actionSendTemplate(ticketId: number, key: string): Promise<string> {
   const [t, tpl] = [await getTicket(ticketId), findTemplate(key)];
   if (!t) return 'Тикет не найден';
   if (!tpl) return 'Шаблон не найден';
+  if (!(await acquireTemplateSendLock(ticketId, key))) return 'Уже отправлено';
   const res = await sendMessage(t.userId, tpl.text);
-  if (!res.ok) return `Не отправлено: ${res.description || 'ошибка'}`;
-  const fresh = (await markOperatorReply(ticketId)) ?? t;
-  if (t.status === 'closed') await reopenTicket(ticketId);
+  if (!res.ok) {
+    await releaseTemplateSendLock(ticketId, key);
+    return `Не отправлено: ${res.description || 'ошибка'}`;
+  }
+  let base: Ticket = t;
+  if (t.status === 'closed') {
+    const reopened = await reopenTicket(ticketId);
+    if (reopened) {
+      base = reopened;
+      if (config.forumMode) await reopenTopic(reopened);
+    }
+  }
+  const fresh = (await markOperatorReply(ticketId)) ?? base;
   if (config.forumMode) {
     const { noteInTopic, syncTopicName } = await import('./forum');
     await noteInTopic(fresh, `✉️ Шаблон «${escapeHtml(tpl.title)}» отправлен клиенту:\n<i>${escapeHtml(tpl.text)}</i>`);

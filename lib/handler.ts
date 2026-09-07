@@ -21,6 +21,7 @@ import {
   renderAdminMenu,
   renderList,
   renderStaleConfirm,
+  renderTemplatePreview,
   renderTemplates,
   renderTicketCard,
   showAdminMenu,
@@ -413,7 +414,7 @@ async function runTicketCommand(cmd: string, ticketId: number, chatId: number, t
     case 'tpl': {
       const { renderTemplates } = await import('./admin');
       const sent = await sendMessage(chatId, '📋 Шаблоны…', { message_thread_id: threadId, disable_notification: true });
-      if (sent.ok && sent.result) await renderTemplates(chatId, sent.result.message_id, ticketId);
+      if (sent.ok && sent.result) await renderTemplates(chatId, sent.result.message_id, ticketId, threadId);
       return;
     }
     default:
@@ -516,9 +517,15 @@ async function handleAdminCallback(cb: TgCallbackQuery, data: string) {
       return;
     case 'tp':
       await answerCallbackQuery(cb.id);
-      await renderTemplates(chatId, messageId, id);
+      await renderTemplates(chatId, messageId, id, threadId);
       return;
-    case 'tpl': {
+    case 'tpl':
+      // Шаблон выбран: показать текст, клиенту пока ничего не уходит.
+      await answerCallbackQuery(cb.id);
+      await renderTemplatePreview(chatId, messageId, id, b || '', threadId);
+      return;
+    case 'tps': {
+      // Подтверждение из предпросмотра: отправить и вернуться к карточке.
       const note = await actionSendTemplate(id, b || '');
       await answerCallbackQuery(cb.id, note, !note.startsWith('Отправлено'));
       await renderTicketCard(chatId, messageId, id, threadId);

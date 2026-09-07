@@ -65,7 +65,10 @@ export async function buildTicketCard(
   return { text, keyboard: rows };
 }
 
-/** Клавиатура шаблонов: по две кнопки в ряд, внизу — назад к карточке. */
+/**
+ * Клавиатура шаблонов: по две кнопки в ряд, внизу — назад к карточке.
+ * Нажатие (tpl:) открывает предпросмотр, отправка идёт отдельной кнопкой (tps:).
+ */
 export function templatesKeyboard(ticketId: number): InlineKeyboard {
   const rows: InlineKeyboard = [];
   for (let i = 0; i < TEMPLATES.length; i += 2) {
