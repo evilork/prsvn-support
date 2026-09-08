@@ -51,13 +51,27 @@ const MODE_TTL_SEC = 20 * 60;
  * в общую переписку, человек бы его никогда не увидел, а в следующий раз
  * услышал «как я писал выше» про текст, которого не было.
  *
+ * ── Откуда именно тридцать ──────────────────────────────
+ * Вебхук бота живёт 60 секунд (maxDuration в app/api/webhook/route.ts), и в эти
+ * 60 обязана уложиться ВСЯ обработка, а не только ожидание модели. Скачивание
+ * вложения берёт до 7 (ATTACHMENT_TIMEOUT_MS в lib/attachments.ts), ожидание
+ * ответа — до 30: вместе 37, и 23 секунды остаются на самый дорогой из наших
+ * исходов — передачу оператору. Она не бесплатна: погасить режим, сказать
+ * человеку, создать тему в группе, скопировать сообщение, нарисовать карточку
+ * и приложить выдержку разговора — это около десятка обращений к Telegram и
+ * Redis подряд.
+ *
+ * Раньше здесь стояло 40, и сумма 10 + 40 = 50 оставляла на всё это десять
+ * секунд. Не хватило бы их — Vercel убивает вызов на шестидесятой секунде, а
+ * повторную доставку того же обновления глушит `isDuplicateUpdate`: человеку не
+ * отправлено ничего, тикета нет, скриншот исчез совсем.
+ *
  * На той стороне бюджет задан под это: ручка `/api/internal/support-ai` даёт
- * модели по 18 секунд на основное и запасное обращение (MODEL_TIMEOUT_MS в
- * route.ts), то есть 36 в худшем случае. Сорок здесь их накрывают, и двадцать
- * до предела вебхука остаются на отказ и передачу оператору. Меняешь одно —
- * меняй и второе.
+ * модели 18 секунд на обращение, но держит общий потолок в 26 (MODEL_BUDGET_MS
+ * там же) и не начинает запасное обращение, если на него не осталось времени.
+ * Меняешь одно — меняй и второе.
  */
-const REQUEST_TIMEOUT_MS = 40_000;
+const REQUEST_TIMEOUT_MS = 30_000;
 
 /** Предел Telegram на одно сообщение. */
 const TG_MAX_CHARS = 4096;
@@ -171,6 +185,265 @@ export async function noteMissingAccountOnce(tgId: number): Promise<boolean> {
   }
 }
 
+// ─── альбом из нескольких фото ─────────────────────────────
+//
+// ── Задача ──────────────────────────────────────────────
+// Собранного альбома не существует: Telegram доставляет его несколькими
+// отдельными обновлениями с общим `media_group_id`, ПАРАЛЛЕЛЬНО и в любом
+// порядке. Ждать остальные негде — вебхук живёт одним запросом, — а разбирать
+// каждое значит задать модели пять одинаковых вопросов, потратить пять
+// обращений из сорока суточных и вывалить человеку пять ответов на одну беду.
+//
+// ── Что здесь устроено ──────────────────────────────────
+// На пачку приходится ОДИН исход. Кто его считает — решает гонка за `claimAlbum`
+// (поэтому в ответе человеку разобранный снимок не называется «первым»).
+//
+// Опасность не в лишнем ответе, а в потере. До 08.09.2026 проигравшие
+// обновления просто делали `return`, и это было верно ровно до первого отказа:
+// стоило разбору кончиться передачей оператору — неудачей скачивания, ESCALATE
+// или сбоем ручки, — как оператор получал ОДИН файл из пяти, а человеку при
+// этом было обещано, что сообщение передано. Оператор не знал, что было ещё
+// четыре, человек был уверен, что отдал все.
+//
+// Поэтому пачка ведёт учёт: каждое обновление записывает свой message_id в
+// список ДО того, как проверит замок, а победитель на любом пути к оператору
+// сначала ставит метку «ушла оператору», а потом дочитывает список и досылает
+// остальные. Порядок именно такой и он важен:
+//
+//   проигравший: RPUSH id → читает метку → если стоит, досылает себя сам;
+//   победитель:  ставит метку → читает список → досылает всё, что в нём есть.
+//
+// Пересечение в обе стороны закрыто. Проигравший, прочитавший метку ДО того,
+// как её поставили, успел записать свой id раньше — значит победитель его
+// увидит. Проигравший, пришедший ПОСЛЕ метки, доносит себя сам. Двойную
+// доставку снимает отдельная отметка на каждое сообщение (`claimAlbumRelay`):
+// доставить дважды не страшно, но оператору незачем видеть один скриншот
+// двумя копиями.
+//
+// Сбой базы всюду толкуем в пользу доставки: лишний файл у оператора дешевле
+// пропавшего.
+
+const ALBUM_KEY = (tgId: number, groupId: string) => `support:aialbum:${tgId}:${groupId}`;
+
+/** Список message_id всей пачки: из него досылаются непрочитанные. */
+const ALBUM_MSGS_KEY = (tgId: number, groupId: string) =>
+  `support:aialbummsgs:${tgId}:${groupId}`;
+
+/** Метка «эта пачка уехала оператору»: опоздавшие идут туда же. */
+const ALBUM_HANDOFF_KEY = (tgId: number, groupId: string) =>
+  `support:aialbumop:${tgId}:${groupId}`;
+
+/** Отметка на конкретное сообщение пачки: оператору оно уже доставлено. */
+const ALBUM_RELAY_KEY = (tgId: number, groupId: string, messageId: number) =>
+  `support:aialbumsent:${tgId}:${groupId}:${messageId}`;
+
+/**
+ * Живёт две минуты: обновления одной пачки приходят за секунды, а держать
+ * метку дольше значит проглотить второй альбом, присланный следом.
+ */
+const ALBUM_TTL_SEC = 120;
+
+/** Сколько сообщений одной пачки не считаются отдельными обращениями. */
+const ALBUM_FREE_MESSAGES = 10;
+
+/**
+ * Разбирать ли ЭТО сообщение из присланной пачки.
+ *
+ * `true` ровно одному обновлению пачки. Остальным — `false`, и они обязаны
+ * спросить `albumWentToOperator`, а не молча выйти: см. рассказ выше.
+ */
+export async function claimAlbum(tgId: number, groupId: string): Promise<boolean> {
+  try {
+    const first = await redis.set(ALBUM_KEY(tgId, groupId), 1, { nx: true, ex: ALBUM_TTL_SEC });
+    return first !== null;
+  } catch (err) {
+    console.error('[support][ai] album mark failed:', err);
+    return true;
+  }
+}
+
+/**
+ * Записать сообщение пачки в общий список.
+ *
+ * Зовётся ПЕРВЫМ делом, до замка: иначе победитель прочитает список раньше, чем
+ * в него попадут опоздавшие, и они потеряются ровно в тот момент, когда пачка
+ * уезжает оператору.
+ */
+export async function noteAlbumMessage(
+  tgId: number,
+  groupId: string,
+  messageId: number,
+): Promise<void> {
+  try {
+    const key = ALBUM_MSGS_KEY(tgId, groupId);
+    await redis.rpush(key, String(messageId));
+    // Больше десяти Telegram в альбом не кладёт, но `media_group_id` приходит
+    // из обновления: список обязан быть ограничен сам, а не верой в отправителя.
+    await redis.ltrim(key, -(ALBUM_FREE_MESSAGES * 2), -1);
+    await redis.expire(key, ALBUM_TTL_SEC);
+  } catch (err) {
+    console.error('[support][ai] album list write failed:', err);
+  }
+}
+
+/**
+ * Пометить пачку как уехавшую оператору.
+ *
+ * Ставится ДО пересылки, а не после: сообщение пачки, пришедшее в эту же
+ * секунду, должно увидеть метку и пойти к оператору само, а не решить, что его
+ * разбирает помощник.
+ */
+export async function markAlbumToOperator(tgId: number, groupId: string): Promise<void> {
+  try {
+    await redis.set(ALBUM_HANDOFF_KEY(tgId, groupId), 1, { ex: ALBUM_TTL_SEC });
+  } catch (err) {
+    console.error('[support][ai] album handoff mark failed:', err);
+  }
+}
+
+/**
+ * Уехала ли пачка оператору.
+ *
+ * Сбой чтения — `true`: опоздавшее сообщение лучше отдать оператору лишний раз,
+ * чем потерять. Двойную доставку всё равно снимает `claimAlbumRelay`.
+ */
+export async function albumWentToOperator(tgId: number, groupId: string): Promise<boolean> {
+  try {
+    return (await redis.get(ALBUM_HANDOFF_KEY(tgId, groupId))) !== null;
+  } catch (err) {
+    console.error('[support][ai] album handoff read failed:', err);
+    return true;
+  }
+}
+
+/**
+ * Какие сообщения пачки записаны. Пустой список — не беда, а обычное дело:
+ * остальные обновления могли ещё не дойти.
+ */
+export async function albumMessages(tgId: number, groupId: string): Promise<number[]> {
+  try {
+    const raw = await redis.lrange(ALBUM_MSGS_KEY(tgId, groupId), 0, -1);
+    if (!Array.isArray(raw)) return [];
+    const ids = raw.map((v) => Number(v)).filter((n) => Number.isSafeInteger(n) && n > 0);
+    return [...new Set(ids)];
+  } catch (err) {
+    console.error('[support][ai] album list read failed:', err);
+    return [];
+  }
+}
+
+/**
+ * Можно ли доставить оператору ИМЕННО это сообщение пачки.
+ *
+ * `true` один раз на сообщение. Нужно потому, что доставить его могут двое:
+ * победитель по списку и само опоздавшее обновление, увидевшее метку. Сбой базы
+ * — `true`: дубль у оператора дешевле пропажи.
+ */
+export async function claimAlbumRelay(
+  tgId: number,
+  groupId: string,
+  messageId: number,
+): Promise<boolean> {
+  try {
+    const first = await redis.set(ALBUM_RELAY_KEY(tgId, groupId, messageId), 1, {
+      nx: true,
+      ex: ALBUM_TTL_SEC,
+    });
+    return first !== null;
+  } catch (err) {
+    console.error('[support][ai] album relay mark failed:', err);
+    return true;
+  }
+}
+
+// ─── суточный бюджет на скачивание вложений ────────────────
+//
+// Лимиты на той стороне считают ОБРАЩЕНИЯ К МОДЕЛИ, и это не то же самое, что
+// расход. Скачивание файла до модели даже не доходит: сообщение, отбитое
+// суточной квотой ручки, всё равно тянуло мегабайт из Telegram, кодировало его
+// в base64 и заливало 1,33 МБ в наш же вебхук — а «Быстрый ответ» после отказа
+// по квоте намеренно НЕ гасится, значит следующая фотография начинала цикл
+// заново. Своя минута — десять сообщений, то есть до двадцати четырёх мегабайт
+// в минуту с одного телеграма, которому положено пять ответов в сутки.
+//
+// Поэтому разрешение спрашивается ДО скачивания и здесь, у бота: ручка про
+// файлы ничего не знает и знать не должна.
+
+/** Сутки по UTC: ключ сам истекает, точность до часового пояса тут не нужна. */
+function dayStamp(): string {
+  return new Date().toISOString().slice(0, 10);
+}
+
+const ATTACH_DAY_KEY = (tgId: number) => `support:aiattach:${tgId}:${dayStamp()}`;
+const ATTACH_DAY_ALL_KEY = () => `support:aiattachall:${dayStamp()}`;
+
+const DAY_SEC = 24 * 60 * 60;
+
+/** Что мешает разобрать вложение. `null` — ничто, качаем. */
+export type AttachmentBudget = null | 'user' | 'global';
+
+/**
+ * Занять место в суточном бюджете на вложение.
+ *
+ * Считается ОДИН раз на разбираемое вложение — то есть один раз на пачку, а не
+ * на каждый её снимок: замок альбома берётся раньше.
+ *
+ * Личный счёт проверяется первым, общий вторым и только если личный прошёл:
+ * отбитое сообщение не должно съедать канал. Сбой базы — пропускаем: лишний
+ * скачанный файл дешевле, чем «Быстрый ответ» который перестал работать у всех
+ * из-за одной недоступной записи.
+ */
+export async function claimAttachmentBudget(tgId: number): Promise<AttachmentBudget> {
+  try {
+    const key = ATTACH_DAY_KEY(tgId);
+    const mine = await redis.incr(key);
+    if (mine === 1) await redis.expire(key, DAY_SEC);
+    if (mine > config.attachmentsPerDay) return 'user';
+
+    const all = ATTACH_DAY_ALL_KEY();
+    const total = await redis.incr(all);
+    if (total === 1) await redis.expire(all, DAY_SEC);
+    if (total > config.attachmentsPerDayGlobal) {
+      console.error(
+        `[support][ai] суточный потолок канала на вложения исчерпан (${config.attachmentsPerDayGlobal})`,
+      );
+      return 'global';
+    }
+    return null;
+  } catch (err) {
+    console.error('[support][ai] attachment budget failed:', err);
+    return null;
+  }
+}
+
+/**
+ * Считать ли ЭТО сообщение пачки отдельным обращением для минутного лимита.
+ *
+ * Пачка — это одно действие человека, а лимит стоит на действиях. Считая
+ * каждое обновление, мы съедали весь минутный запас (`rateLimitPerMinute` = 10)
+ * ровно тем альбомом, на который сами же отвечаем «пришлите нужный снимок
+ * отдельным сообщением»: следующее сообщение оказывалось одиннадцатым и
+ * получало «Слишком много сообщений». Совет и отказ его выполнить шли подряд.
+ *
+ * Первое сообщение пачки считается обычным, следующие девять — бесплатны
+ * (больше десяти Telegram в альбом не кладёт). Всё сверх этого снова считается:
+ * `media_group_id` присваивает Telegram, но опираться на это как на защиту от
+ * потока нельзя.
+ *
+ * Сбой базы — считаем: лимит должен ошибаться в сторону строгости.
+ */
+export async function albumCountsAsMessage(tgId: number, groupId: string): Promise<boolean> {
+  const key = `support:aialbumrate:${tgId}:${groupId}`;
+  try {
+    const n = await redis.incr(key);
+    if (n === 1) await redis.expire(key, ALBUM_TTL_SEC);
+    return n === 1 || n > ALBUM_FREE_MESSAGES;
+  } catch (err) {
+    console.error('[support][ai] album rate mark failed:', err);
+    return true;
+  }
+}
+
 /** Забрать метку (и погасить её): выдержка кладётся в тикет один раз. */
 export async function takeAiHandoff(tgId: number): Promise<number | null> {
   try {
@@ -218,11 +491,27 @@ const FAILED_MSG = 'Быстрый ответ сейчас недоступен.
  * Спросить помощника. Никогда не бросает: любая беда — это `ok: false`.
  *
  * `reset: true` стирает разговор и модель не трогает.
+ *
+ * `image` — data:-адрес картинки (скриншот клиента или кадр из видео). Поле
+ * необязательное и устроено ровно как в кабинете: ручка кладёт его в то же
+ * сообщение переписки, а собирает части для модели `askSupport` на сайте.
+ * Второго пути к модели у картинок нет намеренно — он разошёлся бы с
+ * кабинетом. Размер сюда приходит уже проверенным (`lib/attachments.ts`);
+ * если он всё же велик, ручка отвечает 413, и это обычная неудача: сообщение
+ * человека уедет оператору, а не пропадёт.
+ *
+ * `display` — как ту же реплику показать ЧЕЛОВЕКУ. Вопрос по вложению собран
+ * нами: там служебная обвязка, границы файла и обращение к модели на «ты».
+ * Переписка общая с кабинетом, и без этого поля человек, приславший в бот
+ * скриншот, открывал чат на сайте и видел в СВОЁМ пузыре текст, который писали
+ * не он и не про него, — заодно получая готовую карту наших границ и дословную
+ * формулировку защиты. Модель по-прежнему читает `text`: проверка на внедрение
+ * стоит на нём, и разводить эти два текста дальше показа нельзя.
  */
 export async function askProxysAi(
   tgId: number,
   text: string,
-  opts: { reset?: boolean } = {},
+  opts: { reset?: boolean; image?: string; display?: string } = {},
 ): Promise<AiResult> {
   if (!config.internalApiKey) {
     // До сюда доходить не должно: без ключа кнопки нет. Но если дошло —
@@ -240,7 +529,18 @@ export async function askProxysAi(
         Authorization: `Bearer ${config.internalApiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ telegramId: tgId, text, reset: opts.reset === true }),
+      body: JSON.stringify({
+        telegramId: tgId,
+        text,
+        reset: opts.reset === true,
+        // Поле кладём только когда картинка есть: `image: undefined` в JSON
+        // превратилось бы в отсутствие поля и так, но явное условие говорит
+        // читателю, что обычный текстовый вопрос ходит ровно как раньше.
+        ...(opts.image ? { image: opts.image } : {}),
+        // То же и с `display`: обычный набранный руками вопрос человек видит
+        // ровно таким, каким его читает модель, и подменять там нечего.
+        ...(opts.display ? { display: opts.display } : {}),
+      }),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
@@ -290,6 +590,15 @@ export async function askProxysAi(
 interface StoredMessage {
   role?: unknown;
   text?: unknown;
+  /**
+   * Человеческий вид реплики, если он отличается от того, что читала модель.
+   *
+   * Вопрос по вложению собирает `composeQuestion`: там служебная обвязка,
+   * границы файла и обращение к модели на «ты». Оператору нужна не она, а то,
+   * что человек прислал на самом деле, — иначе в тикете под значком 👤 стоят
+   * 700 знаков нашей же инструкции вместо содержимого файла.
+   */
+  display?: unknown;
   at?: unknown;
 }
 
@@ -327,7 +636,9 @@ export async function aiTranscript(tgId: number, startedAt: number | null): Prom
       .slice(-TRANSCRIPT_MESSAGES)
       .map((m) => {
         const who = m.role === 'assistant' ? '🤖' : '👤';
-        const body = typeof m.text === 'string' ? m.text.trim() : '';
+        // `display` главнее: см. поле в StoredMessage.
+        const shown = typeof m.display === 'string' && m.display.trim() ? m.display : m.text;
+        const body = typeof shown === 'string' ? shown.trim() : '';
         if (!body) return null;
         const cut = body.length > TRANSCRIPT_CHARS ? `${body.slice(0, TRANSCRIPT_CHARS - 1)}…` : body;
         return `${who} ${cut}`;

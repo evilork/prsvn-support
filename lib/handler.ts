@@ -30,15 +30,31 @@ import { escapeHtml } from './account';
 import {
   aiModeStartedAt,
   aiTranscript,
+  albumCountsAsMessage,
+  albumMessages,
+  albumWentToOperator,
   askProxysAi,
+  claimAttachmentBudget,
+  claimAlbum,
+  claimAlbumRelay,
   disableAiMode,
   enableAiMode,
   isAiMode,
   markAiHandoff,
+  markAlbumToOperator,
+  noteAlbumMessage,
   noteMissingAccountOnce,
   splitForTelegram,
   takeAiHandoff,
 } from './ai';
+import {
+  classifyAttachment,
+  composeQuestion,
+  isReadable,
+  loadAttachment,
+  UNKNOWN_ATTACHMENT,
+  type Attachment,
+} from './attachments';
 import { aiQuickAnswerEnabled, config, isAdmin } from './config';
 import {
   buildFaqKeyboard,
@@ -60,6 +76,7 @@ import {
 import {
   addTicketMsg,
   checkRateLimit,
+  claimRateLimitNotice,
   createTicket,
   getActiveTicketForUser,
   getTicket,
@@ -192,8 +209,15 @@ async function handleClientMessage(msg: TgMessage): Promise<void> {
     return;
   }
 
-  if (!(await checkRateLimit(user.id, config.rateLimitPerMinute))) {
-    await sendMessage(user.id, RATE_LIMIT_MSG);
+  // Пачка считается за ОДНО обращение: см. `albumCountsAsMessage`. Без этого
+  // альбом из десяти снимков съедал весь минутный запас, и следующее сообщение
+  // человека — то самое, которое мы сами же просили прислать отдельно, —
+  // получало отказ.
+  const countsAgainstLimit =
+    !msg.media_group_id || (await albumCountsAsMessage(user.id, msg.media_group_id));
+  if (countsAgainstLimit && !(await checkRateLimit(user.id, config.rateLimitPerMinute))) {
+    // Говорим об этом один раз за окно, а не на каждое лишнее сообщение.
+    if (await claimRateLimitNotice(user.id)) await sendMessage(user.id, RATE_LIMIT_MSG);
     return;
   }
 
@@ -202,18 +226,20 @@ async function handleClientMessage(msg: TgMessage): Promise<void> {
     // выдержка разговора отделяет сказанное здесь от сказанного в кабинете.
     const startedAt = await aiModeStartedAt(user.id);
 
-    // Быстрый ответ не видит вложений: ручка принимает только текст. Молча
-    // отдать скриншот оператору нельзя — человек, только что нажавший
-    // «Быстрый ответ», решит, что помощник его разглядывает.
-    if (!text) {
-      await disableAiMode(user.id);
-      await sendMessage(user.id, AI_NO_ATTACHMENTS);
-      const ticket = await forwardClientToAdmins(user, msg);
-      await attachAiTranscript(ticket, user.id, {
-        reason: 'человек прислал вложение — быстрый ответ читает только текст',
-        fromModel: false,
+    // Вложение разбирает отдельная ветка: с 08.09.2026 помощник читает
+    // скриншоты, кадры видео и текстовые файлы сам. Проверяем ДО текста —
+    // подпись к вложению приходит в `caption`, а не в `text`, и «текста нет»
+    // здесь давно не значило «нечего разбирать».
+    const attachment = classifyAttachment(msg);
+    if (attachment || !text) {
+      // Ни вложения, ни текста: местоположение, контакт, опрос. Разбирать
+      // нечего, но и терять нельзя — общий путь отказа.
+      await runAttachmentAnswer(
+        user,
+        msg,
+        attachment ?? { kind: 'unsupported', what: UNKNOWN_ATTACHMENT },
         startedAt,
-      });
+      );
       return;
     }
     await runQuickAnswer(user, msg, text, startedAt);
@@ -386,8 +412,80 @@ const AI_NO_ACCOUNT_NOTE = [
   'Если вопрос именно про аккаунт, напишите оператору кнопкой ниже: он найдёт вас по почте.',
 ].join('\n');
 
-const AI_NO_ATTACHMENTS =
-  'Быстрый ответ читает только текст — скриншоты и файлы он не видит. Передаю ваше сообщение оператору.';
+/**
+ * Отказ по вложению, которое помощник ДЕЙСТВИТЕЛЬНО не читает.
+ *
+ * До 08.09.2026 такой строкой отвечали на любое вложение вообще: «быстрый
+ * ответ читает только текст». Про скриншоты это было неправдой уже тогда —
+ * модель видит картинки и видит их в кабинете, — и стоило это дорого: человек,
+ * приславший фотографию экрана вместо описания (а в поддержке так делает
+ * почти каждый), получал отказ и уезжал к живому оператору с вопросом, на
+ * который помощник ответил бы сам.
+ *
+ * Теперь строка узкая и называет причину: голосовое, аудио, стикер, формат
+ * картинки, который поставщик модели не откроет. Причина обязательна — «я не
+ * могу» без «чего именно» человек читает как «бот сломался».
+ */
+const aiCantRead = (what: string, hint?: string) =>
+  [`${what}. Передаю ваше сообщение оператору: он посмотрит и ответит здесь же.`, hint ?? '']
+    .filter((s) => s !== '')
+    .join('\n\n');
+
+/**
+ * Скачать или прочитать не вышло.
+ *
+ * Отдельно от `aiCantRead`: там мы чего-то не умеем, здесь — не смогли. Для
+ * человека разница в том, стоит ли пробовать ещё раз, поэтому и слова разные.
+ * Общее одно: сообщение не теряется ни в том, ни в другом случае.
+ */
+const aiAttachmentFailed = (reason: string, hint?: string) =>
+  [
+    `${reason}. Чтобы вы не остались без ответа, передаю сообщение оператору — он посмотрит и ответит здесь же.`,
+    hint ?? '',
+  ]
+    .filter((s) => s !== '')
+    .join('\n\n');
+
+/**
+ * Про пачку говорим в том же ответе, которым отвечаем на снимок из неё.
+ *
+ * Разбирается ровно одно сообщение альбома (почему — см. `claimAlbum` в
+ * lib/ai.ts), и промолчать об этом нельзя: человек прислал четыре экрана и
+ * вправе знать, что смотрели один. «Один снимок», а не «первый», — намеренно:
+ * обновления альбома приходят параллельно, и какое из них выиграет гонку, мы
+ * не знаем.
+ */
+const AI_ALBUM_NOTE =
+  'Из присланной пачки я разобрал один снимок, остальные не смотрел. Если важен другой — пришлите его отдельным сообщением.';
+
+/**
+ * Та же оговорка, но когда пачка уехала оператору.
+ *
+ * Здесь она про другое: снимки не «не смотрели», а переданы все до одного. Не
+ * сказать этого — значит оставить человека гадать, дошли ли остальные, а
+ * прежняя формулировка про «разобрал один» тут прямо неверна.
+ */
+const AI_ALBUM_TO_OPERATOR = 'Все снимки из пачки переданы оператору целиком.';
+
+/**
+ * Суточный запас на разбор вложений у этого человека кончился.
+ *
+ * Про текст говорим отдельно и первым делом: помощник продолжает отвечать, и
+ * человек, приславший десятый скриншот, чаще всего может просто описать беду
+ * словами. Отказ без такого выхода читается как «бот сломался».
+ */
+const AI_ATTACH_LIMIT = [
+  'На сегодня разбор присланных файлов и скриншотов исчерпан.',
+  '',
+  'Опишите, пожалуйста, что происходит, словами — на текст я отвечаю как обычно. Если нужен живой человек, нажмите кнопку ниже.',
+].join('\n');
+
+/** То же, но упёрлись мы, а не он: причину называем честно. */
+const AI_ATTACH_BUSY = [
+  'Разбор файлов и скриншотов сейчас перегружен — это на нашей стороне.',
+  '',
+  'Опишите, пожалуйста, беду словами: на текст я отвечаю как обычно. Или нажмите кнопку ниже, ответит живой человек.',
+].join('\n');
 
 const AI_FAILED_HINT =
   'Быстрый ответ сейчас недоступен — это на нашей стороне. Ваше сообщение не потерялось: передаю его оператору, он ответит здесь же.';
@@ -450,22 +548,230 @@ function keepTyping(chatId: number): { stop: () => void } {
 }
 
 /**
+ * Разобрать вложение помощником.
+ *
+ * Исходы, и ни один из них не молчит:
+ *   • это реплика, а не вопрос (стикер, кость) — отвечаем сами, БЕЗ тикета и
+ *     без гашения режима;
+ *   • помощник этого не умеет (голосовое, чужой формат картинки) — говорим что
+ *     именно, называем выход и отдаём оператору;
+ *   • суточный запас на вложения выбран — говорим об этом, зовём описать беду
+ *     словами и оператора НЕ трогаем;
+ *   • не скачалось или не прочиталось — говорим об этом и отдаём оператору;
+ *   • разобрали — обычный ответ помощника, и РЕЖИМ ОСТАЁТСЯ ВКЛЮЧЁННЫМ.
+ *
+ * Последнее — суть правки. Раньше вложение гасило режим, то есть следующее
+ * сообщение человека уезжало оператору, даже если это была обычная текстовая
+ * реплика по тому же вопросу.
+ *
+ * Про пачку: замок берётся ПЕРВЫМ делом, до всех проверок, и любой путь к
+ * оператору уносит туда ВСЕ её сообщения — см. `claimAlbum` в lib/ai.ts.
+ */
+async function runAttachmentAnswer(
+  user: TgUser,
+  msg: TgMessage,
+  attach: Attachment,
+  startedAt: number | null,
+): Promise<void> {
+  const album = msg.media_group_id ?? null;
+
+  if (album) {
+    // Записываем себя ПЕРВЫМ делом, до всякой проверки: победитель гонки
+    // прочитает этот список, если разбор кончится передачей оператору. Порядок
+    // «сначала запись, потом замок» и закрывает гонку — см. рассказ у
+    // `claimAlbum` в lib/ai.ts.
+    await noteAlbumMessage(user.id, album, msg.message_id);
+
+    if (!(await claimAlbum(user.id, album))) {
+      // Разбирает другое сообщение этой пачки. Молча выйти можно ТОЛЬКО пока
+      // разбор идёт: если он уже кончился оператором, это сообщение обязано
+      // доехать туда же, иначе оператор получит один файл из пяти.
+      if (await albumWentToOperator(user.id, album)) {
+        await relayAlbumLeftover(user, msg, album);
+      }
+      return;
+    }
+  }
+
+  if (attach.kind === 'smalltalk') {
+    // Стикер и кость — реплика, а не вопрос. Ни тикета, ни гашения режима:
+    // человек сказал «спасибо», и отвечать на это живым оператором значит
+    // выключить помощника ровно перед следующим настоящим вопросом.
+    await sendMessage(user.id, attach.reply, { reply_markup: aiReplyKeyboard() });
+    await enableAiMode(user.id);
+    return;
+  }
+
+  // Замок пачки взят ВЫШЕ этой проверки: на пачку должен приходиться один
+  // исход, какой бы он ни был. Раньше проверка стояла выше замка, и три PDF
+  // одной пачкой давали три отказа «передаю оператору», три гашения режима и
+  // три выдержки разговора в одной теме тикета.
+  if (!isReadable(attach)) {
+    await handOffToOperator(user, msg, startedAt, {
+      toHuman: aiCantRead(attach.what, attach.hint),
+      reason: `помощник не читает такое вложение (${attach.what.toLowerCase()})`,
+    });
+    return;
+  }
+
+  // Разрешение спрашиваем ДО скачивания. Лимиты ручки сайта считают обращения
+  // к модели и про мегабайты, которые мы тянем из Telegram и заливаем в свой же
+  // вебхук, ничего не знают: сообщение, отбитое там суточной квотой, всё равно
+  // стоило нам полного скачивания.
+  const budget = await claimAttachmentBudget(user.id);
+  if (budget !== null) {
+    // Режим НЕ гасим и оператору не пересылаем — по той же причине, что и при
+    // лимите ручки: пересланный поток просто переезжает на живого человека.
+    // Кнопка рядом, решает он сам.
+    await sendMessage(user.id, budget === 'user' ? AI_ATTACH_LIMIT : AI_ATTACH_BUSY, {
+      reply_markup: aiFallbackKeyboard(),
+    });
+    return;
+  }
+
+  // «Печатает…» держим и на скачивании: файл едет секунды, и без признака
+  // чат выглядит так, будто сообщение не дошло.
+  const typing = keepTyping(user.id);
+  let loaded: Awaited<ReturnType<typeof loadAttachment>>;
+  try {
+    loaded = await loadAttachment(attach);
+  } finally {
+    typing.stop();
+  }
+
+  if (!loaded.ok) {
+    await handOffToOperator(user, msg, startedAt, {
+      toHuman: aiAttachmentFailed(loaded.reason, loaded.hint),
+      reason: `быстрый ответ не смог разобрать вложение (${loaded.reason.toLowerCase()})`,
+    });
+    return;
+  }
+
+  // Подпись к вложению и есть вопрос; подписи нет — вопрос подставляет
+  // `composeQuestion`, там же собираются оговорка про кадр, про обрезанный файл
+  // и человеческий вид реплики для ленты кабинета.
+  const composed = composeQuestion(attach, msg.caption || '', loaded);
+  const notes = [composed.note, album ? AI_ALBUM_NOTE : null].filter(
+    (n): n is string => n !== null,
+  );
+
+  await runQuickAnswer(user, msg, composed.question, startedAt, {
+    image: loaded.image,
+    display: composed.display ?? undefined,
+    note: notes.length > 0 ? notes.join('\n\n') : undefined,
+    album,
+  });
+}
+
+/**
+ * Досдать оператору сообщение пачки, опоздавшее к передаче.
+ *
+ * Оно пришло уже после того, как разбор кончился оператором, поэтому идёт
+ * обычным путём пересылки — без обращения к модели и без своего отказа
+ * человеку: слова про передачу он уже прочитал, повторять их на каждый снимок
+ * незачем.
+ */
+async function relayAlbumLeftover(user: TgUser, msg: TgMessage, album: string): Promise<void> {
+  if (!(await claimAlbumRelay(user.id, album, msg.message_id))) return;
+  await forwardClientToAdmins(user, msg);
+}
+
+/**
+ * Отдать оператору ОСТАЛЬНЫЕ сообщения пачки.
+ *
+ * Зовётся на каждом пути к оператору, сразу после того, как поставлена метка
+ * «пачка ушла оператору». Сообщений в списке может ещё не быть — их обновления
+ * просто не дошли; такие доложат себя сами, увидев метку.
+ *
+ * Настоящего сообщения у нас нет, есть только его номер, поэтому собираем
+ * заглушку: и в теме группы, и в личке оператора вложение доставляется
+ * `copyMessage` по номеру, а текста у сообщения с картинкой всё равно нет.
+ */
+async function relayAlbumRest(user: TgUser, album: string, exceptId: number): Promise<void> {
+  const ids = await albumMessages(user.id, album);
+  for (const id of ids) {
+    if (id === exceptId) continue;
+    if (!(await claimAlbumRelay(user.id, album, id))) continue;
+    await forwardClientToAdmins(user, {
+      message_id: id,
+      from: user,
+      chat: { id: user.id, type: 'private' },
+      date: Math.floor(Date.now() / 1000),
+    });
+  }
+}
+
+/**
+ * Отдать разговор оператору, ничего не потеряв.
+ *
+ * Единственный путь к оператору из ветки помощника — и у неудачи скачивания, и
+ * у сбоя ручки, и у ESCALATE от модели. Порядок здесь не оформление, а суть:
+ *
+ *  1. пометить пачку как ушедшую оператору — ДО пересылки, чтобы сообщение
+ *     альбома, пришедшее в эту же секунду, увидело метку и пошло туда же;
+ *  2. погасить режим — ДО пересылки, иначе следующее сообщение человека уедет
+ *     помощнику мимо только что заведённого тикета;
+ *  3. сказать человеку словами;
+ *  4. переслать это сообщение и ОСТАЛЬНЫЕ сообщения пачки;
+ *  5. положить в тикет разговор, чтобы оператор не начинал с «расскажите, что
+ *     у вас случилось» у человека, который только что всё рассказал.
+ *
+ * Шаг 4 появился 08.09.2026. До него оператору уезжало ровно одно сообщение
+ * пачки: остальные к этому моменту были погашены голым `return`, а человеку
+ * трижды пообещали передачу. Оператор открывал тикет с одним снимком из трёх и
+ * не знал, что было ещё два.
+ */
+async function handOffToOperator(
+  user: TgUser,
+  msg: TgMessage,
+  startedAt: number | null,
+  opts: { toHuman: string; reason: string; fromModel?: boolean; album?: string | null },
+): Promise<void> {
+  const album = opts.album ?? msg.media_group_id ?? null;
+  if (album) await markAlbumToOperator(user.id, album);
+  await disableAiMode(user.id);
+  await sendMessage(user.id, album ? `${opts.toHuman}\n\n${AI_ALBUM_TO_OPERATOR}` : opts.toHuman);
+
+  const ticket = await forwardClientToAdmins(user, msg);
+  if (album) await relayAlbumRest(user, album, msg.message_id);
+
+  await attachAiTranscript(ticket, user.id, {
+    reason: opts.reason,
+    fromModel: opts.fromModel === true,
+    startedAt,
+  });
+}
+
+
+/**
  * Ответить помощником.
  *
  * Любая беда на стороне помощника заканчивается либо внятным отказом, либо
  * оператором — но никогда молчанием: человек, чьё сообщение пропало без следа,
  * второй раз не напишет.
+ *
+ * `opts.image` — картинка к вопросу (скриншот или кадр из видео).
+ * `opts.display` — как ту же реплику показать человеку в ленте кабинета и
+ * оператору в выдержке: служебная обвязка вопроса писалась для модели, а не для
+ * чтения человеком (см. `Composed.display` в lib/attachments.ts).
+ * `opts.note` — наша оговорка, которую человек должен прочитать ВМЕСТЕ с
+ * ответом: что смотрели кадр, а не запись; что из пачки разобран один снимок.
+ * Она идёт перед ответом, а не после, потому что меняет то, как этот ответ
+ * читать.
+ * `opts.album` — пачка, из которой пришло сообщение: на пути к оператору
+ * остальные её сообщения обязаны уехать туда же.
  */
 async function runQuickAnswer(
   user: TgUser,
   msg: TgMessage,
   text: string,
   startedAt: number | null,
+  opts: { image?: string; display?: string; note?: string; album?: string | null } = {},
 ): Promise<void> {
   const typing = keepTyping(user.id);
   let res: Awaited<ReturnType<typeof askProxysAi>>;
   try {
-    res = await askProxysAi(user.id, text);
+    res = await askProxysAi(user.id, text, { image: opts.image, display: opts.display });
   } finally {
     typing.stop();
   }
@@ -486,14 +792,12 @@ async function runQuickAnswer(
     }
 
     // Наша поломка. Сообщение человека уже написано, и терять его из-за нашей
-    // неудачи нельзя — отдаём оператору обычным путём, вместе с разговором.
-    await disableAiMode(user.id);
-    await sendMessage(user.id, AI_FAILED_HINT);
-    const ticket = await forwardClientToAdmins(user, msg);
-    await attachAiTranscript(ticket, user.id, {
+    // неудачи нельзя — отдаём оператору обычным путём, вместе с разговором и
+    // вместе с остальными сообщениями пачки.
+    await handOffToOperator(user, msg, startedAt, {
+      toHuman: AI_FAILED_HINT,
       reason: 'быстрый ответ не сработал на нашей стороне',
-      fromModel: false,
-      startedAt,
+      album: opts.album,
     });
     return;
   }
@@ -501,18 +805,19 @@ async function runQuickAnswer(
   const { answer } = res;
 
   if (answer.escalate) {
-    await disableAiMode(user.id);
-    await sendMessage(user.id, AI_ESCALATED_HINT);
-    const ticket = await forwardClientToAdmins(user, msg);
-    await attachAiTranscript(ticket, user.id, {
+    await handOffToOperator(user, msg, startedAt, {
+      toHuman: AI_ESCALATED_HINT,
       reason: answer.escalate,
       fromModel: true,
-      startedAt,
+      album: opts.album,
     });
     return;
   }
 
-  const chunks = splitForTelegram(answer.text);
+  // Оговорка склеивается с ответом ДО нарезки, а не шлётся отдельным
+  // сообщением: обычный ответ так и остаётся одним сообщением, а если вместе
+  // они не влезут — нарежет `splitForTelegram` по границам абзацев.
+  const chunks = splitForTelegram(opts.note ? `${opts.note}\n\n${answer.text}` : answer.text);
 
   // Аккаунта под этим телеграмом нет — говорим об этом прямо и один раз за
   // разговор. Молчать нельзя: приглашение обещало «если кабинет привязан», и

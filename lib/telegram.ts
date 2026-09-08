@@ -182,21 +182,3 @@ export function closeForumTopic(chatId: number, threadId: number) {
 export function reopenForumTopic(chatId: number, threadId: number) {
   return call<unknown>('reopenForumTopic', { chat_id: chatId, message_thread_id: threadId });
 }
-
-/** Download a Telegram photo/image-document as a base64 data URL (for vision models). */
-export async function getFileAsDataUrl(fileId: string): Promise<string | null> {
-  const f = await call<{ file_path?: string }>('getFile', { file_id: fileId });
-  if (!f.ok || !f.result?.file_path) return null;
-  try {
-    const res = await fetch(
-      `https://api.telegram.org/file/bot${config.botToken}/${f.result.file_path}`,
-      { signal: AbortSignal.timeout(20000) },
-    );
-    if (!res.ok) return null;
-    const buf = Buffer.from(await res.arrayBuffer());
-    if (buf.length > 6_000_000) return null;
-    return `data:image/jpeg;base64,${buf.toString('base64')}`;
-  } catch {
-    return null;
-  }
-}
