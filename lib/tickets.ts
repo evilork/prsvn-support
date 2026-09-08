@@ -1,5 +1,6 @@
 // lib/tickets.ts
 import { Redis } from '@upstash/redis';
+import { disableAiMode } from './ai';
 import { config } from './config';
 import type { TgUser } from './types';
 
@@ -39,6 +40,7 @@ const K = {
   ticketMsgs: (id: number) => `support:ticket:${id}:msgs`,
   thread: (threadId: number) => `support:thread:${threadId}`,
   tplLock: (id: number, key: string) => `support:tpl-lock:${id}:${key}`,
+  update: (updateId: number) => `support:upd:${updateId}`,
 };
 
 async function saveTicket(t: Ticket) {
@@ -98,10 +100,20 @@ export async function touchTicket(
   return t;
 }
 
-/** Оператор ответил: с этого момента тикет не «ждёт ответа». */
+/**
+ * Оператор ответил: с этого момента тикет не «ждёт ответа».
+ *
+ * Здесь же гаснет режим быстрого ответа. Живой диалог всегда главнее
+ * помощника: без этого следующая реплика человека — «сделал, не помогло» —
+ * доставалась бы модели, оператор оставался бы с тикетом, где клиент будто бы
+ * промолчал, и через неделю тишины такой тикет уехал бы в массовое закрытие.
+ * Место выбрано одно на все пути ответа: и Reply в личке, и сообщение в теме,
+ * и отправка шаблона проходят через эту функцию.
+ */
 export async function markOperatorReply(ticketId: number): Promise<Ticket | null> {
   const t = await getTicket(ticketId);
   if (!t) return null;
+  await disableAiMode(t.userId);
   t.lastOperatorAt = Date.now();
   t.updatedAt = t.lastOperatorAt;
   await Promise.all([
@@ -246,6 +258,33 @@ export async function checkRateLimit(
   const count = await redis.incr(key);
   if (count === 1) await redis.expire(key, 60);
   return count <= limit;
+}
+
+// ─── повторная доставка обновлений ─────────────────────────
+
+/** Сколько помним обработанные обновления. */
+const UPDATE_SEEN_TTL_SEC = 120;
+
+/**
+ * Это обновление уже обработано?
+ *
+ * Telegram повторяет доставку, если ответа на вебхук не дождался, а «Быстрый
+ * ответ» держит запрос до сорока секунд — повтор здесь не исключение, а
+ * ожидаемое поведение. Без отсечки один вопрос человека означал бы второе
+ * обращение к модели (деньги и дневная квота) и второй тикет у оператора.
+ *
+ * SET NX: ключ ставит тот, кто пришёл первым. Сбой базы решаем в пользу
+ * доставки — лучше обработать дважды, чем потерять единственное сообщение.
+ */
+export async function isDuplicateUpdate(updateId: number): Promise<boolean> {
+  if (!Number.isFinite(updateId) || updateId <= 0) return false;
+  try {
+    const first = await redis.set(K.update(updateId), 1, { nx: true, ex: UPDATE_SEEN_TTL_SEC });
+    return first === null;
+  } catch (err) {
+    console.error('[support] update dedup failed:', err);
+    return false;
+  }
 }
 
 // ─── admin msg ↔ ticket mapping for Reply lookup ──────────

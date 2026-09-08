@@ -29,10 +29,11 @@ import {
   editMessageText,
   pinChatMessage,
   reopenForumTopic,
+  sendHtmlOrPlain,
   sendMessage,
 } from './telegram';
 import { getTicket, getTicketMsgs, isWaiting, setTicketThread, type Ticket } from './tickets';
-import type { TgMessage } from './types';
+import type { TgMessage, TgResponse } from './types';
 
 /** Сколько последних сообщений клиента переносить в тему у старого тикета. */
 const MIGRATE_LAST = 10;
@@ -156,11 +157,19 @@ export async function refreshTopicCard(ticket: Ticket): Promise<void> {
   });
 }
 
-/** Служебная строка в тему (что отправили клиенту шаблоном и т.п.). */
-export async function noteInTopic(ticket: Ticket, text: string): Promise<void> {
-  if (!config.groupId || !ticket.threadId) return;
-  await sendMessage(config.groupId, text, {
-    parse_mode: 'HTML',
+/**
+ * Служебная строка в тему (что отправили клиенту шаблоном, выдержка разговора).
+ *
+ * Отправка с откатом на обычный текст: форум — основная ветка на проде, а в
+ * этих строках есть чужой текст. Отказ Telegram по разметке означал бы, что
+ * оператор просто не увидит написанного, и узнать об этом было бы неоткуда.
+ */
+export async function noteInTopic(
+  ticket: Ticket,
+  text: string,
+): Promise<TgResponse<{ message_id: number }> | null> {
+  if (!config.groupId || !ticket.threadId) return null;
+  return sendHtmlOrPlain(config.groupId, text, {
     message_thread_id: ticket.threadId,
     disable_notification: true,
   });

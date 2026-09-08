@@ -27,7 +27,18 @@ export function clientLabel(t: Ticket, withId = true): string {
 export async function buildTicketCard(
   t: Ticket,
 ): Promise<{ text: string; keyboard: InlineKeyboard }> {
-  const [panel, banned] = await Promise.all([loadAccountPanel(t.userId), isBanned(t.userId)]);
+  // Карточка — украшение вокруг доставленного сообщения, и ронять доставку она
+  // права не имеет: сбой чтения состояния должен превращаться в честную строку
+  // «не прочиталось», а не в потерянный тикет. Пустую карточку сюда подставлять
+  // нельзя — «аккаунт не найден» у платящего клиента это неверный факт, по
+  // которому оператор ему и ответит.
+  const [panel, banned] = await Promise.all([
+    loadAccountPanel(t.userId).catch((err) => {
+      console.error('[support][card] состояние аккаунта не прочиталось:', err);
+      return null;
+    }),
+    isBanned(t.userId),
+  ]);
   const now = Date.now();
   const lastClient = t.lastClientAt ? ` · клиент писал ${fmtAgo(t.lastClientAt, now)}` : '';
 
@@ -36,7 +47,9 @@ export async function buildTicketCard(
     `👤 ${clientLabel(t)}`,
     `🕒 создан ${fmtDate(t.createdAt)} · сообщений ${t.messagesCount}${lastClient}`,
     '',
-    renderAccountPanel(panel, now),
+    panel
+      ? renderAccountPanel(panel, now)
+      : '⚠️ Состояние аккаунта сейчас не прочиталось (сбой базы). Нажмите «🔄 Обновить».',
   ].join('\n');
 
   const rows: InlineKeyboard = [

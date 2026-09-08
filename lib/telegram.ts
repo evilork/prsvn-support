@@ -40,6 +40,49 @@ export function sendMessage(chatId: number, text: string, opts: SendOpts = {}) {
   });
 }
 
+/**
+ * «Печатает…» в чате клиента.
+ *
+ * Нужно ровно там, где ответ приходит не мгновенно: помощник думает секунды, и
+ * без этой строки чат выглядит так, будто сообщение не дошло. Telegram гасит
+ * признак сам через пять секунд или на первом же нашем сообщении, так что
+ * снимать его не нужно.
+ *
+ * Неудача здесь ничего не меняет: это украшение, а не доставка.
+ */
+export function sendChatAction(chatId: number, action: 'typing' = 'typing') {
+  return call<boolean>('sendChatAction', { chat_id: chatId, action });
+}
+
+/**
+ * Отправка с разметкой и откатом на обычный текст.
+ *
+ * Наши строки размечены HTML и несут внутри чужой текст — имя клиента, причину
+ * от модели, выдержку разговора. Он экранируется, но одна ошибка в
+ * экранировании — это не кривой шрифт, а НЕОТПРАВЛЕННОЕ сообщение: Telegram
+ * отказывает всему сообщению целиком. Поэтому неудача с разметкой означает
+ * повтор без неё, а не потерю. Живёт здесь, а не у вызывающего: тем же
+ * свойством обладает любая наша размеченная строка, и вторая копия этой
+ * функции однажды отстала бы от первой.
+ */
+export async function sendHtmlOrPlain(chatId: number, html: string, opts: SendOpts = {}) {
+  const res = await sendMessage(chatId, html, { ...opts, parse_mode: 'HTML' });
+  if (res.ok) return res;
+  console.warn('[support] HTML send failed, retrying as plain text:', res.description);
+  return sendMessage(chatId, stripTags(html), opts);
+}
+
+/** Разметку долой, сущности обратно в знаки. */
+export function stripTags(html: string): string {
+  return html
+    .replace(/<[^>]*>/g, '')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&');
+}
+
 export function editMessageText(
   chatId: number,
   messageId: number,

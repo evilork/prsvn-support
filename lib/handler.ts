@@ -27,7 +27,19 @@ import {
   showAdminMenu,
 } from './admin';
 import { escapeHtml } from './account';
-import { config, isAdmin } from './config';
+import {
+  aiModeStartedAt,
+  aiTranscript,
+  askProxysAi,
+  disableAiMode,
+  enableAiMode,
+  isAiMode,
+  markAiHandoff,
+  noteMissingAccountOnce,
+  splitForTelegram,
+  takeAiHandoff,
+} from './ai';
+import { aiQuickAnswerEnabled, config, isAdmin } from './config';
 import {
   buildFaqKeyboard,
   CLIENT_CONTACT_HINT,
@@ -35,11 +47,13 @@ import {
   findNode,
   type FaqNode,
 } from './faq';
-import { ensureTopic, relayClientToTopic, reopenTopic, syncTopicName } from './forum';
+import { ensureTopic, noteInTopic, relayClientToTopic, reopenTopic, syncTopicName } from './forum';
 import {
   answerCallbackQuery,
   copyMessage,
   editMessageText,
+  sendChatAction,
+  sendHtmlOrPlain,
   sendMessage,
   setMessageReaction,
 } from './telegram';
@@ -51,6 +65,7 @@ import {
   getTicket,
   getTicketMsgs,
   isBanned,
+  isDuplicateUpdate,
   isWaiting,
   mapAdminMsgToTicket,
   markOperatorReply,
@@ -82,6 +97,15 @@ function isServiceMessage(msg: TgMessage): boolean {
 // ════════════════════════════════════════════════════════════════════
 
 export async function handleUpdate(update: Update): Promise<void> {
+  // Повторная доставка — не редкость, а норма: Telegram присылает обновление
+  // ещё раз, если ответ на вебхук задержался, а «Быстрый ответ» держит запрос
+  // до сорока секунд. Без отсечки один вопрос человека стоил бы двух обращений
+  // к модели и двух тикетов у оператора.
+  if (await isDuplicateUpdate(update.update_id)) {
+    console.warn(`[support] повторная доставка update ${update.update_id} — пропущена`);
+    return;
+  }
+
   if (update.callback_query) {
     await handleCallback(update.callback_query);
     return;
@@ -93,7 +117,7 @@ export async function handleUpdate(update: Update): Promise<void> {
   if (!fromId) return;
 
   if (msg.chat.type === 'private') {
-    if (isAdmin(fromId)) await handleAdminMessage(msg);
+    if (isAdmin(fromId) && !(await adminSpeaksAsClient(msg, fromId))) await handleAdminMessage(msg);
     else await handleClientMessage(msg);
     return;
   }
@@ -114,6 +138,24 @@ export async function handleUpdate(update: Update): Promise<void> {
       });
     }
   }
+}
+
+/**
+ * Вести ли админа по КЛИЕНТСКОЙ ветке.
+ *
+ * Владелец бота — он же единственный админ, и запор «сначала владельцу» без
+ * этой оговорки бил бы мимо: его свободный текст всегда уходил в разбор команд
+ * оператора, а «Быстрый ответ» проверить на себе было нечем. Условия строгие,
+ * чтобы работа оператора не пострадала:
+ *   • режим помощника у него включён (кнопкой или командой /ai);
+ *   • сообщение не Reply — Reply это ответ клиенту, и его перехватывать нельзя;
+ *   • сообщение не команда — /start, /find, /close остаются админскими.
+ */
+async function adminSpeaksAsClient(msg: TgMessage, fromId: number): Promise<boolean> {
+  if (!aiQuickAnswerEnabled(fromId)) return false;
+  if (msg.reply_to_message) return false;
+  if ((msg.text || '').trim().startsWith('/')) return false;
+  return isAiMode(fromId);
 }
 
 function setupHint(chatId: number, isForum: boolean): string {
@@ -155,18 +197,79 @@ async function handleClientMessage(msg: TgMessage): Promise<void> {
     return;
   }
 
-  await forwardClientToAdmins(user, msg);
+  if (await shouldAnswerWithAi(user.id)) {
+    // Отметку времени берём ДО того, как что-нибудь погасит режим: по ней
+    // выдержка разговора отделяет сказанное здесь от сказанного в кабинете.
+    const startedAt = await aiModeStartedAt(user.id);
+
+    // Быстрый ответ не видит вложений: ручка принимает только текст. Молча
+    // отдать скриншот оператору нельзя — человек, только что нажавший
+    // «Быстрый ответ», решит, что помощник его разглядывает.
+    if (!text) {
+      await disableAiMode(user.id);
+      await sendMessage(user.id, AI_NO_ATTACHMENTS);
+      const ticket = await forwardClientToAdmins(user, msg);
+      await attachAiTranscript(ticket, user.id, {
+        reason: 'человек прислал вложение — быстрый ответ читает только текст',
+        fromModel: false,
+        startedAt,
+      });
+      return;
+    }
+    await runQuickAnswer(user, msg, text, startedAt);
+    return;
+  }
+
+  const ticket = await forwardClientToAdmins(user, msg);
+
+  // Человек нажал «Связаться со специалистом» после разговора с помощником, и
+  // тикета в тот момент ещё не было. Теперь есть — кладём в него разговор,
+  // иначе оператор начнёт с «расскажите, что у вас случилось» у человека,
+  // который только что всё рассказал.
+  const handoff = await takeAiHandoff(user.id);
+  if (handoff !== null) {
+    await attachAiTranscript(ticket, user.id, {
+      reason: 'человек попросил живого оператора после разговора с помощником',
+      fromModel: false,
+      startedAt: handoff,
+    });
+  }
+}
+
+/**
+ * Отвечать ли этому сообщению помощником, а не тикетом.
+ *
+ * Открытый тикет, ЖДУЩИЙ оператора, главнее режима: человек, чья жалоба уже
+ * лежит у живого человека, пишет продолжение той жалобы, и проглотить его
+ * помощником — худшее, что здесь можно сделать.
+ *
+ * А вот тикет, на который оператор УЖЕ ответил, режиму не мешает. Тикеты
+ * закрываются вручную и автоматически лишь через неделю тишины, так что
+ * «любой открытый тикет главнее» означало бы кнопку, которая у большинства
+ * писавших в поддержку не работает вовсе.
+ *
+ * Это безопасно только потому, что ответ оператора САМ гасит режим (см.
+ * `markOperatorReply`): иначе следующая реплика человека в живом диалоге —
+ * «сделал, не помогло» — досталась бы помощнику, а оператор остался бы с
+ * тикетом, где клиент будто бы промолчал. Убираешь то — возвращай проверку
+ * «любой открытый тикет главнее» сюда.
+ */
+async function shouldAnswerWithAi(userId: number): Promise<boolean> {
+  if (!aiQuickAnswerEnabled(userId)) return false;
+  if (!(await isAiMode(userId))) return false;
+  const active = await getActiveTicketForUser(userId);
+  return !active || !isWaiting(active);
 }
 
 async function showClientMenu(userId: number) {
   const root = findNode('menu')!;
   await sendMessage(userId, CLIENT_WELCOME, {
     parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: buildFaqKeyboard(root) },
+    reply_markup: { inline_keyboard: buildFaqKeyboard(root, { ai: aiQuickAnswerEnabled(userId) }) },
   });
 }
 
-async function forwardClientToAdmins(user: TgUser, msg: TgMessage) {
+async function forwardClientToAdmins(user: TgUser, msg: TgMessage): Promise<Ticket> {
   let ticket = await getActiveTicketForUser(user.id);
   let isNew = false;
   if (!ticket) {
@@ -181,11 +284,12 @@ async function forwardClientToAdmins(user: TgUser, msg: TgMessage) {
 
   if (config.forumMode) {
     const delivered = await relayViaForum(fresh, msg, isNew, wasWaiting);
-    if (delivered) return;
+    if (delivered) return fresh;
     console.warn('[support] forum relay failed, falling back to private chats');
   }
 
   await relayViaPrivate(fresh, user, msg, isNew);
+  return fresh;
 }
 
 /** Тема в группе: создать при необходимости, положить сообщение, обновить имя. */
@@ -245,6 +349,272 @@ async function relayViaPrivate(ticket: Ticket, user: TgUser, msg: TgMessage, isN
 }
 
 // ════════════════════════════════════════════════════════════════════
+// Быстрый ответ (ProxysAI)
+// ════════════════════════════════════════════════════════════════════
+//
+// Помощник тот же, что в кабинете на сайте: правила, состояние аккаунта и
+// переписка общие, бот только приносит вопрос и уносит ответ (см. lib/ai.ts).
+// Здесь — только поведение в чате: когда включать режим, что показывать и
+// когда отдавать разговор живому человеку.
+
+// Про аккаунт сказано УСЛОВНО, и это не осторожность ради осторожности.
+// Аккаунт ищется по alias:tg_<id>, а человек, заведённый по почте и не
+// привязавший телеграм, здесь обычное дело — ему безусловное «я вижу ваш
+// баланс» ломается первым же ответом «аккаунта по этому Telegram у нас нет».
+// Проверить до приглашения нечем: договор с ручкой не знает вопроса «есть ли
+// аккаунт», а звать модель ради этого — платить за пустой запрос.
+const AI_GREETING = [
+  '<b>⚡ Быстрый ответ</b>',
+  '',
+  'Спрашивайте своими словами — отвечу за несколько секунд.',
+  '',
+  'Если ваш кабинет привязан к этому Telegram, я вижу баланс, устройства, тариф и последние платежи и не буду переспрашивать очевидное. Помогаю с подключением, «не работает», оплатой и настройками приложений.',
+  '',
+  'Живой оператор никуда не делся: кнопка ниже открыта всегда.',
+].join('\n');
+
+/** Приписка к приглашению, когда вопрос человека уже лежит у оператора. */
+const AI_GREETING_WAITING = [
+  '',
+  '⚠️ Сейчас у вас открыт вопрос к оператору. Пока он не ответит, ваши сообщения идут ему, а не мне — чтобы ничего не потерялось.',
+].join('\n');
+
+const AI_MORE_HINT = 'Слушаю. Напишите вопрос следующим сообщением.';
+
+/**
+ * Приписка после ответа, когда кабинета под этим телеграмом не нашлось.
+ *
+ * Показывается один раз за разговор: человеку важно узнать, что помощник
+ * отвечает не про его аккаунт, но повторять это под каждым ответом — значит
+ * превратить полезное предупреждение в шум.
+ */
+const AI_NO_ACCOUNT_NOTE = [
+  'ℹ️ Кабинета, привязанного к этому Telegram, я не вижу — про ваш баланс, устройства и платежи ответить не могу.',
+  '',
+  'Если вопрос именно про аккаунт, напишите оператору кнопкой ниже: он найдёт вас по почте.',
+].join('\n');
+
+const AI_NO_ATTACHMENTS =
+  'Быстрый ответ читает только текст — скриншоты и файлы он не видит. Передаю ваше сообщение оператору.';
+
+const AI_FAILED_HINT =
+  'Быстрый ответ сейчас недоступен — это на нашей стороне. Ваше сообщение не потерялось: передаю его оператору, он ответит здесь же.';
+
+const AI_ESCALATED_HINT =
+  'Здесь нужен живой человек — передаю разговор оператору вместе с тем, что мы уже разобрали. Он ответит здесь же.';
+
+const CONTACT_BUTTON = { text: '🆘 Связаться со специалистом', callback_data: 'contact' } as const;
+const MENU_BUTTON = { text: '🏠 В меню', callback_data: 'faq:menu' } as const;
+
+/** Клавиатура под ответом помощника. */
+function aiReplyKeyboard() {
+  return {
+    inline_keyboard: [
+      [{ text: '⚡ Спросить ещё', callback_data: 'ai:more' }],
+      [CONTACT_BUTTON],
+      [MENU_BUTTON],
+    ],
+  };
+}
+
+/** Приглашение в режим помощника. */
+async function sendAiGreeting(userId: number, waiting: boolean): Promise<void> {
+  await sendMessage(userId, waiting ? AI_GREETING + AI_GREETING_WAITING : AI_GREETING, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[CONTACT_BUTTON], [MENU_BUTTON]] },
+  });
+}
+
+/** Клавиатура под отказом: помощник не смог — остаётся человек. */
+function aiFallbackKeyboard() {
+  return { inline_keyboard: [[CONTACT_BUTTON], [MENU_BUTTON]] };
+}
+
+/** Как часто повторять «печатает…», пока ждём модель. */
+const TYPING_REFRESH_MS = 4000;
+
+/**
+ * Держать «печатает…» всё время ожидания.
+ *
+ * Telegram гасит признак через пять секунд, а модель с размышлением думает
+ * десятки: одного вызова хватает ровно на то, чтобы человек решил, что бот
+ * завис, и начал писать «ау?». Повтор стоит одного дешёвого запроса в четыре
+ * секунды и снимается в `finally` — иначе он пережил бы сам ответ.
+ */
+function keepTyping(chatId: number): { stop: () => void } {
+  void sendChatAction(chatId);
+  const timer: ReturnType<typeof setInterval> = setInterval(() => {
+    void sendChatAction(chatId);
+  }, TYPING_REFRESH_MS);
+  return { stop: () => clearInterval(timer) };
+}
+
+/**
+ * Ответить помощником.
+ *
+ * Любая беда на стороне помощника заканчивается либо внятным отказом, либо
+ * оператором — но никогда молчанием: человек, чьё сообщение пропало без следа,
+ * второй раз не напишет.
+ */
+async function runQuickAnswer(
+  user: TgUser,
+  msg: TgMessage,
+  text: string,
+  startedAt: number | null,
+): Promise<void> {
+  const typing = keepTyping(user.id);
+  let res: Awaited<ReturnType<typeof askProxysAi>>;
+  try {
+    res = await askProxysAi(user.id, text);
+  } finally {
+    typing.stop();
+  }
+
+  if (!res.ok) {
+    if (res.kind === 'limited') {
+      // Лимит — не поломка, а следствие потока сообщений от самого человека.
+      // Пересылать такое оператору автоматически нельзя: поток просто переедет
+      // на живого человека. Режим при этом НЕ гасим — погасив, мы отправили бы
+      // оператору следующее же сообщение, то есть сделали ровно то, чего этой
+      // веткой избегаем. Кнопка рядом, решает он сам.
+      await sendMessage(
+        user.id,
+        `${res.message}\n\nВаш вопрос не сохранён: если он срочный, напишите его оператору кнопкой ниже.`,
+        { reply_markup: aiFallbackKeyboard() },
+      );
+      return;
+    }
+
+    // Наша поломка. Сообщение человека уже написано, и терять его из-за нашей
+    // неудачи нельзя — отдаём оператору обычным путём, вместе с разговором.
+    await disableAiMode(user.id);
+    await sendMessage(user.id, AI_FAILED_HINT);
+    const ticket = await forwardClientToAdmins(user, msg);
+    await attachAiTranscript(ticket, user.id, {
+      reason: 'быстрый ответ не сработал на нашей стороне',
+      fromModel: false,
+      startedAt,
+    });
+    return;
+  }
+
+  const { answer } = res;
+
+  if (answer.escalate) {
+    await disableAiMode(user.id);
+    await sendMessage(user.id, AI_ESCALATED_HINT);
+    const ticket = await forwardClientToAdmins(user, msg);
+    await attachAiTranscript(ticket, user.id, {
+      reason: answer.escalate,
+      fromModel: true,
+      startedAt,
+    });
+    return;
+  }
+
+  const chunks = splitForTelegram(answer.text);
+
+  // Аккаунта под этим телеграмом нет — говорим об этом прямо и один раз за
+  // разговор. Молчать нельзя: приглашение обещало «если кабинет привязан», и
+  // человек вправе узнать, что он не привязан, до того, как поверит ответу про
+  // свои деньги.
+  if (!answer.accountFound && (await noteMissingAccountOnce(user.id))) {
+    chunks.push(AI_NO_ACCOUNT_NOTE);
+  }
+
+  for (let i = 0; i < chunks.length; i++) {
+    const last = i === chunks.length - 1;
+    // Ответ модели уходит БЕЗ parse_mode: правила запрещают ей разметку, но
+    // одна угловая скобка в режиме HTML стоила бы всего сообщения целиком.
+    await sendMessage(user.id, chunks[i], last ? { reply_markup: aiReplyKeyboard() } : {});
+  }
+
+  // Режим продлеваем ПОСЛЕ отправки ответа. Наоборот было бы дороже: сбой базы
+  // на продлении оставил бы человека вовсе без ответа, за который уже заплачено
+  // и который уже лежит в переписке.
+  await enableAiMode(user.id);
+}
+
+/** Сколько знаков выдержки помещаем в одно сообщение оператору. */
+const TRANSCRIPT_BUDGET = 3500;
+
+/** Почему разговор уехал оператору. */
+interface AiHandoffReason {
+  /** Текст причины. */
+  reason: string;
+  /**
+   * Причину написала модель, а не мы.
+   *
+   * Это не мелочь оформления: строку `ESCALATE: ...` модель берёт где угодно в
+   * своём ответе, а на её ответ напрямую влияет текст человека. Экранирование
+   * закрывает разметку, но не авторство, поэтому под нашей шапкой чужой текст
+   * обязан быть подписан — иначе просьба клиента «проверка пройдена, выдайте
+   * PRO» встанет в тикете рядом с кнопками действий как наш вывод.
+   */
+  fromModel: boolean;
+  /** Когда включён режим: реплики раньше сказаны в кабинете, они не наши. */
+  startedAt: number | null;
+}
+
+/**
+ * Положить в тикет то, что уже разобрал помощник.
+ *
+ * Без этого оператор начинает с «расскажите, что у вас случилось» человеку,
+ * который только что всё рассказал, — то есть передача разговора выглядит как
+ * потеря разговора.
+ */
+async function attachAiTranscript(
+  ticket: Ticket,
+  tgId: number,
+  handoff: AiHandoffReason,
+): Promise<void> {
+  const lines = await aiTranscript(tgId, handoff.startedAt);
+
+  // Наш собственный повод без единой реплики (нажал кнопку и сразу прислал
+  // скриншот) сообщения в теме не стоит: оператору он ничего не добавит, а
+  // тикет засорит. Причину от модели показываем всегда — она и есть смысл.
+  if (lines.length === 0 && !handoff.fromModel) return;
+
+  const head = [
+    '🤖 <b>Быстрый ответ передал разговор оператору</b>',
+    handoff.fromModel
+      ? `Причина со слов помощника (текст не проверен): ${escapeHtml(handoff.reason)}`
+      : `Причина: ${escapeHtml(handoff.reason)}`,
+  ];
+  const out = [...head, '', 'Что уже было сказано:'];
+
+  let used = out.join('\n').length;
+  for (const line of lines) {
+    const html = escapeHtml(line);
+    if (used + html.length + 1 > TRANSCRIPT_BUDGET) {
+      out.push('…');
+      break;
+    }
+    out.push(html);
+    used += html.length + 1;
+  }
+  if (lines.length === 0) out.push('(переписки в этом канале нет)');
+
+  const note = out.join('\n');
+
+  // Тикет перечитываем: тему могли создать прямо сейчас, при пересылке
+  // сообщения, и у объекта на руках её ещё нет.
+  const fresh = (await getTicket(ticket.id)) ?? ticket;
+
+  if (config.forumMode && fresh.threadId) {
+    // Форум — основная ветка на проде, и молчаливая потеря выдержки здесь
+    // стоила бы ровно того, ради чего выдержка делается. `noteInTopic` шлёт с
+    // откатом на обычный текст.
+    await noteInTopic(fresh, note);
+    return;
+  }
+  for (const adminId of config.adminUserIds) {
+    const sent = await sendHtmlOrPlain(adminId, note);
+    if (sent.ok && sent.result) await mapAdminMsgToTicket(sent.result.message_id, fresh.id);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════
 // Operator reply → client (общее для лички и темы)
 // ════════════════════════════════════════════════════════════════════
 
@@ -292,6 +662,27 @@ async function handleAdminMessage(msg: TgMessage): Promise<void> {
     await showAdminMenu(msg.chat.id);
     return;
   }
+  // «Быстрый ответ» на себе.
+  //
+  // Владелец бота — он же единственный админ, и /start показывает ему админ-
+  // панель без клиентских кнопок. Без этой команды выкат «сначала владельцу»
+  // проверить было бы нечем: кнопка ⚡ живёт в клиентском меню, куда он не
+  // попадает. Дальше его свободный текст уводит в помощника
+  // `adminSpeaksAsClient`, а /start и Reply остаются работой оператора.
+  if (text === '/ai') {
+    const id = msg.from!.id;
+    if (!aiQuickAnswerEnabled(id)) {
+      await sendMessage(
+        id,
+        'Быстрый ответ недоступен: нет INTERNAL_API_KEY в окружении бота либо вас нет в SUPPORT_AI_USER_IDS.',
+      );
+      return;
+    }
+    await enableAiMode(id);
+    const active = await getActiveTicketForUser(id);
+    await sendAiGreeting(id, !!active && isWaiting(active));
+    return;
+  }
   if (/^\/id/.test(text)) {
     await sendMessage(msg.chat.id, `Ваш ID: <code>${msg.from!.id}</code>`, { parse_mode: 'HTML' });
     return;
@@ -322,11 +713,15 @@ async function handleAdminMessage(msg: TgMessage): Promise<void> {
     return;
   }
 
+  const aiHint = aiQuickAnswerEnabled(msg.from!.id)
+    ? '\n/ai — проверить «Быстрый ответ» на себе.'
+    : '';
   await sendMessage(
     msg.chat.id,
-    config.forumMode
+    (config.forumMode
       ? 'Тикеты ведутся в темах группы. Здесь: /start — панель, /find — найти аккаунт.'
-      : 'Чтобы ответить клиенту — сделайте Reply на его сообщение.\n/start — панель, /find — найти аккаунт, /close 12 — закрыть тикет.',
+      : 'Чтобы ответить клиенту — сделайте Reply на его сообщение.\n/start — панель, /find — найти аккаунт, /close 12 — закрыть тикет.') +
+      aiHint,
   );
 }
 
@@ -435,7 +830,15 @@ async function handleCallback(cb: TgCallbackQuery): Promise<void> {
     return;
   }
 
-  if (isAdmin(user.id)) {
+  // Клиентские кнопки разбираем ДО развилки «админ или клиент»: они живут
+  // только в личке клиентского меню, среди админских такого callback_data нет,
+  // а владелец бота — сам себе админ, и без этой оговорки нажатие ⚡ у него
+  // уходило бы в разбор админских кнопок и молча не делало ничего.
+  const clientButton =
+    msg.chat.type === 'private' &&
+    (data === 'contact' || data === 'ai' || data === 'ai:more' || data.startsWith('faq:'));
+
+  if (isAdmin(user.id) && !clientButton) {
     await handleAdminCallback(cb, data);
     return;
   }
@@ -447,7 +850,39 @@ async function handleCallback(cb: TgCallbackQuery): Promise<void> {
 
   if (data === 'contact') {
     await answerCallbackQuery(cb.id);
+    // Человек попросил живого — режим выключаем сразу, иначе следующее его
+    // сообщение перехватит помощник, которого он только что отверг. Но сначала
+    // запоминаем, с какого момента шёл разговор: тикета ещё нет, он появится с
+    // ближайшим сообщением, и выдержка разговора должна приехать в него.
+    await markAiHandoff(user.id, await aiModeStartedAt(user.id));
+    await disableAiMode(user.id);
     await sendMessage(user.id, CLIENT_CONTACT_HINT, { parse_mode: 'HTML' });
+    return;
+  }
+
+  if (data === 'ai' || data === 'ai:more') {
+    // Признак проверяем и здесь, а не только при рисовании клавиатуры: кнопка
+    // живёт в старом сообщении и переживёт сужение перечня допущенных.
+    if (!aiQuickAnswerEnabled(user.id)) {
+      await answerCallbackQuery(cb.id, 'Быстрый ответ сейчас недоступен.', true);
+      return;
+    }
+    await answerCallbackQuery(cb.id);
+    await enableAiMode(user.id);
+
+    // Предупреждение про ждущий тикет нужно ОБЕИМ кнопкам. «Спросить ещё» — та
+    // же кнопка под старым ответом, и человек, чей вопрос за это время уехал
+    // оператору, прочитал бы «Слушаю» и не получил ответа вовсе: помощника в
+    // этом состоянии не пускает `shouldAnswerWithAi`.
+    const active = await getActiveTicketForUser(user.id);
+    const waiting = !!active && isWaiting(active);
+
+    if (data === 'ai:more') {
+      await sendMessage(user.id, waiting ? AI_MORE_HINT + AI_GREETING_WAITING : AI_MORE_HINT);
+      return;
+    }
+
+    await sendAiGreeting(user.id, waiting);
     return;
   }
 
@@ -470,14 +905,18 @@ async function renderFaqNode(chatId: number, messageId: number, node: FaqNode) {
     ? `<b>${escapeHtml(stripEmoji(node.title))}</b>\n\n${node.text}`
     : CLIENT_WELCOME;
 
+  // Клиентское меню всегда живёт в личке, так что chatId здесь — это и есть
+  // идентификатор человека, которому решается показать «Быстрый ответ».
+  const keyboard = { inline_keyboard: buildFaqKeyboard(node, { ai: aiQuickAnswerEnabled(chatId) }) };
+
   const res = await editMessageText(chatId, messageId, text, {
     parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: buildFaqKeyboard(node) },
+    reply_markup: keyboard,
   });
   if (!res.ok) {
     await sendMessage(chatId, text, {
       parse_mode: 'HTML',
-      reply_markup: { inline_keyboard: buildFaqKeyboard(node) },
+      reply_markup: keyboard,
     });
   }
 }

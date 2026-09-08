@@ -174,9 +174,24 @@ const PANEL_HUMAN: Record<string, string> = {
   fr: 'Франция',
 };
 
-async function resolveAccountId(tgId: number): Promise<string> {
+/**
+ * Телеграм-идентификатор → идентификатор аккаунта.
+ *
+ * Экспортировано, потому что то же правило нужно переписке с ИИ-помощником:
+ * она лежит в ключе `support:chat:<accountId>`, общем с кабинетом. Своя копия
+ * этих трёх строк рядом означала бы, что однажды бот и кабинет разойдутся в
+ * том, чей это разговор.
+ *
+ * Сбой чтения НЕ глотаем. Раньше здесь стоял `.catch(() => null)`, и это была
+ * подмена личности: у человека, слившего телеграм с почтовым аккаунтом, записи
+ * лежат под `em_...`, а мы возвращали пустой `tg_<id>` — оператор видел
+ * «аккаунт не найден» у платящего клиента с пятью устройствами. Остальные
+ * чтения в `loadAccountPanelById` и так бросают, так что глушилка стояла ровно
+ * на том единственном месте, где ошибка меняет ответ, а не ломает экран.
+ */
+export async function resolveAccountId(tgId: number): Promise<string> {
   const candidate = `tg_${tgId}`;
-  const aliased = await redis.get<string>(`alias:${candidate}`).catch(() => null);
+  const aliased = await redis.get<string>(`alias:${candidate}`);
   return typeof aliased === 'string' && aliased ? aliased : candidate;
 }
 

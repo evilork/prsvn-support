@@ -418,7 +418,15 @@ export function findParent(id: string, node: FaqNode = FAQ_TREE): FaqNode | null
   return null;
 }
 
-export function buildFaqKeyboard(node: FaqNode): InlineKeyboard {
+/**
+ * Клавиатура раздела FAQ.
+ *
+ * `ai` решает, рисовать ли «Быстрый ответ». Признак приходит снаружи, а не
+ * считается здесь: клавиатура не знает, КОМУ её показывают, и знать не должна.
+ * Значение по умолчанию `false` оставляет прежние вызовы такими, какими они
+ * были: кнопки нет, пока её явно не попросили.
+ */
+export function buildFaqKeyboard(node: FaqNode, opts: { ai?: boolean } = {}): InlineKeyboard {
   const rows: InlineKeyboard = [];
 
   if (node.children) {
@@ -436,6 +444,13 @@ export function buildFaqKeyboard(node: FaqNode): InlineKeyboard {
     ]);
   }
 
+  // Порядок строк здесь и есть смысл: быстрый ответ стоит НАД оператором,
+  // потому что отвечает за секунды и в большинстве случаев закрывает вопрос.
+  // Живой человек остаётся ниже и никуда не девается — иначе кнопка помощника
+  // читалась бы как «оператора больше нет».
+  if (opts.ai) {
+    rows.push([{ text: '⚡ Быстрый ответ', callback_data: 'ai' }]);
+  }
   rows.push([{ text: '🆘 Связаться со специалистом', callback_data: 'contact' }]);
   return rows;
 }

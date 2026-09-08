@@ -325,9 +325,16 @@ export async function findAccountText(query: string): Promise<string> {
   const q = query.trim();
   if (!q) return 'Укажите ID Telegram, почту или идентификатор аккаунта: /find 6123153890';
   let panel;
-  if (/^\d{5,}$/.test(q)) panel = await loadAccountPanel(Number(q));
-  else if (/^(tg_|em_)/.test(q)) panel = await loadAccountPanelById(q);
-  else if (q.includes('@') && q.includes('.')) panel = await loadAccountPanelById(`em_${q.toLowerCase()}`);
-  else return 'По имени искать нельзя — нужен ID Telegram (цифры), почта или tg_…/em_….';
+  try {
+    if (/^\d{5,}$/.test(q)) panel = await loadAccountPanel(Number(q));
+    else if (/^(tg_|em_)/.test(q)) panel = await loadAccountPanelById(q);
+    else if (q.includes('@') && q.includes('.')) panel = await loadAccountPanelById(`em_${q.toLowerCase()}`);
+    else return 'По имени искать нельзя — нужен ID Telegram (цифры), почта или tg_…/em_….';
+  } catch (err) {
+    // Сбой базы и «аккаунта нет» — разные ответы. Второй оператор передаст
+    // клиенту как факт, поэтому вслух говорим именно то, что случилось.
+    console.error('[support][find] состояние аккаунта не прочиталось:', err);
+    return '⚠️ База сейчас не отвечает — состояние аккаунта не прочиталось. Повторите запрос.';
+  }
   return `🔎 <b>${escapeHtml(q)}</b> → <code>${escapeHtml(panel.accountId)}</code>\n\n${renderAccountPanel(panel)}`;
 }
