@@ -260,6 +260,26 @@ export async function checkRateLimit(
   return count <= limit;
 }
 
+/**
+ * Сказать ли человеку про лимит.
+ *
+ * Один раз за окно, а не на каждое лишнее сообщение. Иначе человек, приславший
+ * пачку из десяти снимков, получает подряд десять одинаковых «Слишком много
+ * сообщений» — то есть наказание превращается в тот самый поток, от которого
+ * лимит и защищает, только в обратную сторону.
+ *
+ * Сбой базы — говорим: молчание в ответ на сообщение хуже повторной строки.
+ */
+export async function claimRateLimitNotice(userId: number): Promise<boolean> {
+  try {
+    const first = await redis.set(`support:ratemsg:${userId}`, 1, { nx: true, ex: 60 });
+    return first !== null;
+  } catch (err) {
+    console.error('[support] rate notice mark failed:', err);
+    return true;
+  }
+}
+
 // ─── повторная доставка обновлений ─────────────────────────
 
 /** Сколько помним обработанные обновления. */

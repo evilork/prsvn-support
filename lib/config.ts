@@ -1,5 +1,11 @@
 // lib/config.ts
 
+/** Целое из окружения; мусор и ноль — значит умолчание, а не «выключено». */
+function envInt(name: string, fallback: number): number {
+  const n = Number(process.env[name]);
+  return Number.isSafeInteger(n) && n > 0 ? n : fallback;
+}
+
 function required(name: string): string {
   const v = process.env[name];
   if (!v) throw new Error(`Missing env: ${name}`);
@@ -100,6 +106,32 @@ export const config = {
   forumMode: groupId !== null,
 
   rateLimitPerMinute: 10,
+
+  /**
+   * Сколько вложений в сутки бот скачивает для одного телеграма.
+   *
+   * Лимиты ручки сайта считают ОБРАЩЕНИЯ К МОДЕЛИ, а скачивание файла до
+   * ручки даже не доходит: отбитое по суточной квоте сообщение всё равно
+   * тянуло мегабайт из Telegram, кодировало его в base64 и заливало 1,33 МБ в
+   * наш же вебхук. Одноразовому телеграму без кабинета положено 5 обращений к
+   * модели в сутки — остальные тысячи скачиваний в тот же день оплачивались
+   * нами при нулевой выручке, и остановить их было нечем: SUPPORT_CHAT_OFF
+   * гасит модель, а не скачивание.
+   *
+   * Двадцать — это вчетверо больше самого длинного живого разбора со
+   * скриншотами и вдвое больше самой длинной пачки, которую кладёт Telegram.
+   */
+  attachmentsPerDay: envInt('SUPPORT_ATTACH_DAILY', 20),
+
+  /**
+   * То же на ВЕСЬ канал за сутки.
+   *
+   * Личный потолок ограничивает одного человека, а платим мы за всех: двести
+   * заведённых за минуту телеграмов дают четыре тысячи скачиваний, и каждый —
+   * трафик из Telegram плюс треть сверху в вебхук.
+   */
+  attachmentsPerDayGlobal: envInt('SUPPORT_ATTACH_DAILY_GLOBAL', 600),
+
   pageSize: 10,
   ticketDataTtlSec: 60 * 60 * 24 * 180,
 
