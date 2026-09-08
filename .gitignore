@@ -9,3 +9,6 @@ out
 .vercel
 .turbo
 next-env.d.ts.bak
+
+# Кэш инкрементальной сборки TypeScript: меняется на каждом tsc и грязнит дерево.
+*.tsbuildinfo
