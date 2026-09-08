@@ -31,6 +31,36 @@ export async function POST(req: NextRequest) {
   return NextResponse.json({ ok: true });
 }
 
-export async function GET() {
-  return NextResponse.json({ ok: true, service: 'proxysvpn-support-bot' });
+/**
+ * Проверка живости, а под секретом вебхука — ещё и состояние окружения.
+ *
+ * Появилось 08.09.2026 после часа вслепую: переменная `INTERNAL_API_KEY` была
+ * заведена в панели, кнопка «Быстрый ответ» не появлялась, и отличить «не
+ * положили в тот проект» от «положили не в то окружение» и от «не совпал
+ * идентификатор» было нечем — журналы функции снаружи не читаются, а
+ * единственный признак поломки это ОТСУТСТВИЕ кнопки, то есть ничего.
+ *
+ * Значений секретов здесь нет и быть не может: только признак «задано» и
+ * длина, которой хватает, чтобы заметить обрезанную вставку. Перечень
+ * допущенных к помощнику показывается целиком — это идентификаторы Telegram,
+ * а не секрет, и именно они чаще всего и не совпадают.
+ */
+export async function GET(req: NextRequest) {
+  const secret = req.headers.get('x-telegram-bot-api-secret-token');
+  if (secret !== config.webhookSecret) {
+    return NextResponse.json({ ok: true, service: 'proxysvpn-support-bot' });
+  }
+
+  return NextResponse.json({
+    ok: true,
+    service: 'proxysvpn-support-bot',
+    env: {
+      hasInternalApiKey: config.internalApiKey.length > 0,
+      internalApiKeyLength: config.internalApiKey.length,
+      aiAccess: config.aiAccess,
+      adminUserIds: config.adminUserIds,
+      forumMode: config.forumMode,
+      siteUrl: config.siteUrl,
+    },
+  });
 }
