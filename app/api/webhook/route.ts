@@ -1,6 +1,7 @@
 // app/api/webhook/route.ts
 import { NextRequest, NextResponse } from 'next/server';
 import { config } from '@/lib/config';
+import { askProxysAi } from '@/lib/ai';
 import { handleUpdate } from '@/lib/handler';
 import type { Update } from '@/lib/types';
 
@@ -49,6 +50,23 @@ export async function GET(req: NextRequest) {
   const secret = req.headers.get('x-telegram-bot-api-secret-token');
   if (secret !== config.webhookSecret) {
     return NextResponse.json({ ok: true, service: 'proxysvpn-support-bot' });
+  }
+
+  // Проба всего пути до модели, без единого сообщения в Telegram.
+  //
+  // Иначе проверить «работает ли помощник» можно только нажав кнопку у себя в
+  // чате, а это сообщения живому человеку и невозможность проверить чужой
+  // сценарий. Здесь тот же самый вызов, что делает бот, и виден он только
+  // тому, кто знает секрет вебхука.
+  const probe = req.nextUrl.searchParams.get('probe');
+  if (probe) {
+    const id = Number(req.nextUrl.searchParams.get('as') || 0);
+    if (!Number.isSafeInteger(id) || id <= 0) {
+      return NextResponse.json({ ok: false, error: 'нужен параметр as с числовым id' }, { status: 400 });
+    }
+    const started = Date.now();
+    const result = await askProxysAi(id, probe.slice(0, 500));
+    return NextResponse.json({ ok: true, probe: result, tookMs: Date.now() - started });
   }
 
   return NextResponse.json({
