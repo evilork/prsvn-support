@@ -27,6 +27,7 @@ import {
   showAdminMenu,
 } from './admin';
 import { escapeHtml } from './account';
+import { awayNotice, claimAwayNote, clearAway, parseAwayUntil, readAway, setAway } from './away';
 import {
   aiModeStartedAt,
   aiTranscript,
@@ -308,12 +309,37 @@ async function forwardClientToAdmins(user: TgUser, msg: TgMessage): Promise<Tick
 
   if (config.forumMode) {
     const delivered = await relayViaForum(fresh, msg, isNew, wasWaiting);
-    if (delivered) return fresh;
+    if (delivered) {
+      await noteAwayOnce(user.id, fresh.id);
+      return fresh;
+    }
     console.warn('[support] forum relay failed, falling back to private chats');
   }
 
   await relayViaPrivate(fresh, user, msg, isNew);
+  await noteAwayOnce(user.id, fresh.id);
   return fresh;
+}
+
+/**
+ * Сказать человеку, что живого ответа сегодня не будет.
+ *
+ * Стоит ЗДЕСЬ, а не у каждой кнопки, потому что сюда сходятся все пути к
+ * оператору: и «Связаться со специалистом», и передача от помощника, и наша
+ * поломка, и вложение, которого помощник не читает. Приписка у каждой кнопки
+ * означала бы четыре копии одного текста и один забытый путь.
+ *
+ * Своя ошибка ничего не ломает: тикет уже доставлен, приписка — вежливость.
+ */
+async function noteAwayOnce(userId: number, ticketId: number): Promise<void> {
+  try {
+    const away = await readAway();
+    if (!away) return;
+    if (!(await claimAwayNote(ticketId))) return;
+    await sendMessage(userId, awayNotice(away).trimStart(), { parse_mode: 'HTML' });
+  } catch (err) {
+    console.error('[support][away] приписка не ушла:', err);
+  }
 }
 
 /** Тема в группе: создать при необходимости, положить сообщение, обновить имя. */
@@ -987,6 +1013,47 @@ async function handleAdminMessage(msg: TgMessage): Promise<void> {
     await sendAiGreeting(id);
     return;
   }
+  // Объявление об отъезде: включить, снять, посмотреть.
+  //
+  // Команда, а не переменная окружения: снимать объявление придётся из
+  // поездки, а правка переменной в Vercel требует нового выката.
+  if (/^\/away\b/.test(text) || text === '/away') {
+    const arg = text.replace(/^\/away\s*/, '').trim();
+    if (!arg) {
+      const away = await readAway();
+      await sendMessage(
+        msg.chat.id,
+        away
+          ? `Объявление включено до ${new Date(away.until).toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' })} МСК.\n\nСнять: <code>/away off</code>`
+          : 'Объявления нет.\n\nВключить: <code>/away 11.09 16:30</code>',
+        { parse_mode: 'HTML' },
+      );
+      return;
+    }
+    if (/^(off|нет|стоп)$/i.test(arg)) {
+      await clearAway();
+      await sendMessage(msg.chat.id, 'Объявление снято. Клиентам про отъезд больше не пишем.');
+      return;
+    }
+    const until = parseAwayUntil(arg);
+    if (until === null) {
+      await sendMessage(msg.chat.id, 'Не разобрал дату. Так: <code>/away 11.09 16:30</code> или <code>/away off</code>.', {
+        parse_mode: 'HTML',
+      });
+      return;
+    }
+    await setAway(until);
+    const away = await readAway();
+    await sendMessage(
+      msg.chat.id,
+      away
+        ? `Включено. Вот что увидит клиент:\n${awayNotice(away)}`
+        : 'Не удалось включить: база не ответила.',
+      { parse_mode: 'HTML' },
+    );
+    return;
+  }
+
   if (/^\/id/.test(text)) {
     await sendMessage(msg.chat.id, `Ваш ID: <code>${msg.from!.id}</code>`, { parse_mode: 'HTML' });
     return;
@@ -1160,7 +1227,13 @@ async function handleCallback(cb: TgCallbackQuery): Promise<void> {
     // ближайшим сообщением, и выдержка разговора должна приехать в него.
     await markAiHandoff(user.id, await aiModeStartedAt(user.id));
     await disableAiMode(user.id);
-    await sendMessage(user.id, CLIENT_CONTACT_HINT, { parse_mode: 'HTML' });
+    // Тикета ещё нет, поэтому отметка «уже показывали» тут не работает: она
+    // привязана к тикету. Повтор безобиден — человек сам нажал кнопку и ждёт
+    // ответа именно про оператора.
+    const away = await readAway();
+    await sendMessage(user.id, CLIENT_CONTACT_HINT + (away ? awayNotice(away) : ''), {
+      parse_mode: 'HTML',
+    });
     return;
   }
 
