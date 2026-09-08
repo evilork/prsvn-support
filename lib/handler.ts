@@ -239,26 +239,24 @@ async function handleClientMessage(msg: TgMessage): Promise<void> {
 /**
  * Отвечать ли этому сообщению помощником, а не тикетом.
  *
- * Открытый тикет, ЖДУЩИЙ оператора, главнее режима: человек, чья жалоба уже
- * лежит у живого человека, пишет продолжение той жалобы, и проглотить его
- * помощником — худшее, что здесь можно сделать.
+ * Решает ТОЛЬКО режим. До 08.09.2026 открытый тикет, ждущий оператора, был
+ * главнее: считалось, что продолжение жалобы, уже лежащей у человека, нельзя
+ * проглотить помощником. На живом выкате это оказалось хуже проблемы, которую
+ * лечило: владелец нажал «Быстрый ответ», написал вопрос и не получил ничего —
+ * сообщение молча уехало оператору, а окно помощника осталось пустым.
  *
- * А вот тикет, на который оператор УЖЕ ответил, режиму не мешает. Тикеты
- * закрываются вручную и автоматически лишь через неделю тишины, так что
- * «любой открытый тикет главнее» означало бы кнопку, которая у большинства
- * писавших в поддержку не работает вовсе.
+ * Нажатие кнопки — это явно высказанный выбор, и спорить с ним нельзя: экран
+ * называется «Быстрый ответ», и в нём отвечает помощник.
  *
- * Это безопасно только потому, что ответ оператора САМ гасит режим (см.
- * `markOperatorReply`): иначе следующая реплика человека в живом диалоге —
- * «сделал, не помогло» — досталась бы помощнику, а оператор остался бы с
- * тикетом, где клиент будто бы промолчал. Убираешь то — возвращай проверку
- * «любой открытый тикет главнее» сюда.
+ * Три вещи держат это безопасным. Ответ оператора САМ гасит режим (см.
+ * `markOperatorReply`), поэтому живой диалог помощник не перехватывает.
+ * Режим живёт двадцать минут и не переживает паузу. И сам помощник передаёт
+ * человека оператору, когда тот просит живого человека или когда советы не
+ * помогли.
  */
 async function shouldAnswerWithAi(userId: number): Promise<boolean> {
   if (!aiQuickAnswerEnabled(userId)) return false;
-  if (!(await isAiMode(userId))) return false;
-  const active = await getActiveTicketForUser(userId);
-  return !active || !isWaiting(active);
+  return await isAiMode(userId);
 }
 
 async function showClientMenu(userId: number) {
@@ -370,13 +368,7 @@ const AI_GREETING = [
   '',
   'Если ваш кабинет привязан к этому Telegram, я вижу баланс, устройства, тариф и последние платежи и не буду переспрашивать очевидное. Помогаю с подключением, «не работает», оплатой и настройками приложений.',
   '',
-  'Живой оператор никуда не делся: кнопка ниже открыта всегда.',
-].join('\n');
-
-/** Приписка к приглашению, когда вопрос человека уже лежит у оператора. */
-const AI_GREETING_WAITING = [
-  '',
-  '⚠️ Сейчас у вас открыт вопрос к оператору. Пока он не ответит, ваши сообщения идут ему, а не мне — чтобы ничего не потерялось.',
+  'Нужен живой человек — просто скажите об этом, передам оператору вместе с нашим разговором.',
 ].join('\n');
 
 const AI_MORE_HINT = 'Слушаю. Напишите вопрос следующим сообщением.';
@@ -406,22 +398,30 @@ const AI_ESCALATED_HINT =
 const CONTACT_BUTTON = { text: '🆘 Связаться со специалистом', callback_data: 'contact' } as const;
 const MENU_BUTTON = { text: '🏠 В меню', callback_data: 'faq:menu' } as const;
 
-/** Клавиатура под ответом помощника. */
+/**
+ * Клавиатура под ответом помощника.
+ *
+ * Кнопки оператора здесь намеренно НЕТ: это окно разговора с помощником, и
+ * ссылка на живого человека под каждым его ответом читается как «я не
+ * справился». Выход к оператору никуда не делся: об этом достаточно попросить
+ * словами, помощник передаёт сам, а «В меню» возвращает туда, где кнопка
+ * оператора стоит постоянно. Под ОТКАЗОМ помощника кнопка остаётся — там она
+ * единственный путь дальше, см. `aiFallbackKeyboard`.
+ */
 function aiReplyKeyboard() {
   return {
     inline_keyboard: [
       [{ text: '⚡ Спросить ещё', callback_data: 'ai:more' }],
-      [CONTACT_BUTTON],
       [MENU_BUTTON],
     ],
   };
 }
 
 /** Приглашение в режим помощника. */
-async function sendAiGreeting(userId: number, waiting: boolean): Promise<void> {
-  await sendMessage(userId, waiting ? AI_GREETING + AI_GREETING_WAITING : AI_GREETING, {
+async function sendAiGreeting(userId: number): Promise<void> {
+  await sendMessage(userId, AI_GREETING, {
     parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: [[CONTACT_BUTTON], [MENU_BUTTON]] },
+    reply_markup: { inline_keyboard: [[MENU_BUTTON]] },
   });
 }
 
@@ -679,8 +679,7 @@ async function handleAdminMessage(msg: TgMessage): Promise<void> {
       return;
     }
     await enableAiMode(id);
-    const active = await getActiveTicketForUser(id);
-    await sendAiGreeting(id, !!active && isWaiting(active));
+    await sendAiGreeting(id);
     return;
   }
   if (/^\/id/.test(text)) {
@@ -870,19 +869,12 @@ async function handleCallback(cb: TgCallbackQuery): Promise<void> {
     await answerCallbackQuery(cb.id);
     await enableAiMode(user.id);
 
-    // Предупреждение про ждущий тикет нужно ОБЕИМ кнопкам. «Спросить ещё» — та
-    // же кнопка под старым ответом, и человек, чей вопрос за это время уехал
-    // оператору, прочитал бы «Слушаю» и не получил ответа вовсе: помощника в
-    // этом состоянии не пускает `shouldAnswerWithAi`.
-    const active = await getActiveTicketForUser(user.id);
-    const waiting = !!active && isWaiting(active);
-
     if (data === 'ai:more') {
-      await sendMessage(user.id, waiting ? AI_MORE_HINT + AI_GREETING_WAITING : AI_MORE_HINT);
+      await sendMessage(user.id, AI_MORE_HINT);
       return;
     }
 
-    await sendAiGreeting(user.id, waiting);
+    await sendAiGreeting(user.id);
     return;
   }
 
