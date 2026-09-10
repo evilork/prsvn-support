@@ -296,13 +296,47 @@ async function sendDigest(items: { ticket: Ticket; waitedMs: number }[], stats: 
   stats.digestSent = true;
 }
 
+/**
+ * Кто имеет право запускать проход.
+ *
+ * Правильный путь один: заголовок с `CRON_SECRET`. Пока переменная задана,
+ * ничего другого не принимается.
+ *
+ * Запасной путь появился 10.09.2026 по факту: Vercel вызвал ручку в 06:30,
+ * получил 401 и ничего не сделал — переменной в проекте не было, а владелец в
+ * дороге до 11-го, то есть ровно в те сутки, ради которых крон и написан.
+ * Поэтому БЕЗ заданного секрета мы принимаем вызов самого Vercel, опознавая
+ * его по `user-agent: vercel-cron/...`.
+ *
+ * Почему это допустимо. Подделать строку опознания может кто угодно, но
+ * выигрыш от подделки нулевой: каждое действие прохода стоит за своим замком —
+ * личный пинг по тикету раз в сутки, общая сводка раз в двенадцать часов,
+ * автоответ по тикету один. Сколько бы раз ручку ни дёрнули, оператор получит
+ * не больше, чем от честного расписания, а посторонний не увидит ничего:
+ * ответ содержит только счётчики.
+ *
+ * Как только `CRON_SECRET` появится, запасной путь выключится сам, и в отметке
+ * это видно полем `openMode`.
+ */
+function cronAllowed(req: NextRequest): { ok: boolean; openMode: boolean } {
+  if (config.cronSecret) {
+    return { ok: req.headers.get('authorization') === `Bearer ${config.cronSecret}`, openMode: false };
+  }
+  const ua = (req.headers.get('user-agent') || '').toLowerCase();
+  return { ok: ua.startsWith('vercel-cron/'), openMode: true };
+}
+
 export async function GET(req: NextRequest) {
-  if (!config.cronSecret || req.headers.get('authorization') !== `Bearer ${config.cronSecret}`) {
+  const gate = cronAllowed(req);
+  if (!gate.ok) {
     // Отметка ДО отказа и есть весь смысл `beat`: 401 в журнале функций
     // выглядит как чужой сканер, и «CRON_SECRET забыли завести» от «крона нет
     // вовсе» иначе не отличить ничем. `noSecret` прямо называет причину.
     await beat({ ok: false, unauthorized: true, noSecret: !config.cronSecret });
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 });
+  }
+  if (gate.openMode) {
+    console.warn('[support][stale] CRON_SECRET не задан — проход пущен по опознанию вызова Vercel');
   }
 
   const startedAt = Date.now();
@@ -367,10 +401,10 @@ export async function GET(req: NextRequest) {
     }
   } catch (err) {
     console.error('[support][stale] проход не удался:', err);
-    await beat({ ok: false, ms: Date.now() - startedAt, error: String(err), ...stats });
+    await beat({ ok: false, openMode: gate.openMode, ms: Date.now() - startedAt, error: String(err), ...stats });
     return NextResponse.json({ ok: false, stats }, { status: 500 });
   }
 
-  await beat({ ok: true, ms: Date.now() - startedAt, ...stats });
+  await beat({ ok: true, openMode: gate.openMode, ms: Date.now() - startedAt, ...stats });
   return NextResponse.json({ ok: true, ms: Date.now() - startedAt, stats });
 }
