@@ -87,8 +87,10 @@ import {
   isWaiting,
   mapAdminMsgToTicket,
   markOperatorReply,
+  noteUndelivered,
   reopenTicket,
   setBanned,
+  takeUndelivered,
   ticketFromAdminMsg,
   ticketFromThread,
   touchTicket,
@@ -223,6 +225,14 @@ async function handleClientMessage(msg: TgMessage): Promise<void> {
   }
 
   if (await shouldAnswerWithAi(user.id)) {
+    // Человек снова пишет — значит бота он разблокировал, и сохранённый ответ
+    // оператора обязан доехать НЕЗАВИСИМО от того, куда пойдёт это сообщение.
+    // До 10.09.2026 досылка жила только в `forwardClientToAdmins`, то есть на
+    // пути «уезжает оператору»: разблокировав бота и нажав «⚡ Быстрый ответ»,
+    // человек общался с помощником, ответ оператора так и лежал в очереди, а
+    // тема оставалась 🚫 — оператор считал его недоступным.
+    await flushUndeliveredFor(user.id);
+
     // Отметку времени берём ДО того, как что-нибудь погасит режим: по ней
     // выдержка разговора отделяет сказанное здесь от сказанного в кабинете.
     const startedAt = await aiModeStartedAt(user.id);
@@ -303,9 +313,17 @@ async function forwardClientToAdmins(user: TgUser, msg: TgMessage): Promise<Tick
   }
   const wasWaiting = isWaiting(ticket);
 
-  const touched = await touchTicket(ticket.id, msg.message_id);
+  // Текст едет в тикет: без него крону тихих тикетов нечего спросить у
+  // помощника — в записи до сих пор лежал только номер сообщения. Подпись к
+  // вложению (`caption`) годится ровно так же, как обычный текст.
+  const touched = await touchTicket(ticket.id, msg.message_id, msg.text || msg.caption);
   await addTicketMsg(ticket.id, msg.message_id);
   const fresh = touched ?? ticket;
+
+  // Человек снова пишет — значит бота он разблокировал. Досылаем то, что не
+  // доехало, ДО пересылки его сообщения оператору: иначе он читает вопрос
+  // «получилось?» раньше ответа, на который тот вопрос ссылается.
+  await flushUndelivered(fresh);
 
   if (config.forumMode) {
     const delivered = await relayViaForum(fresh, msg, isNew, wasWaiting);
@@ -319,6 +337,59 @@ async function forwardClientToAdmins(user: TgUser, msg: TgMessage): Promise<Tick
   await relayViaPrivate(fresh, user, msg, isNew);
   await noteAwayOnce(user.id, fresh.id);
   return fresh;
+}
+
+/**
+ * Досла́ть ответы оператора, которые в прошлый раз не доехали.
+ *
+ * ЗАЧЕМ. До 10.09.2026 недоставленный ответ («bot was blocked by the user»)
+ * просто исчезал: оператор видел «⚠️ Не доставлено» и шёл дальше, человек
+ * оставался с тишиной. Когда он разблокировал бота и написал снова, оператор
+ * начинал заново — а ответ так и лежал ненаписанным.
+ *
+ * Своя неудача ничего не ломает: сообщение клиента уедет оператору в любом
+ * случае, а очередь мы уже забрали — повторный ответ на тот же вопрос хуже,
+ * чем один потерянный.
+ */
+async function flushUndelivered(ticket: Ticket): Promise<void> {
+  // Дешёвая отсечка: у подавляющего большинства тикетов очередь пуста, а
+  // `takeUndelivered` — это чтение и запись тикета на КАЖДОЕ сообщение
+  // клиента. Тикет здесь всегда свежий (только что прочитан), поэтому
+  // проверка по полям равнозначна обращению к базе.
+  if (!ticket.blocked && !ticket.pendingOperator?.length) return;
+  try {
+    const queue = await takeUndelivered(ticket.id);
+    if (queue.length === 0) return;
+    await sendMessage(
+      ticket.userId,
+      queue.length === 1
+        ? 'Наш ответ не доходил до вас — вот он:'
+        : `Наши ответы не доходили до вас (${queue.length}) — вот они:`,
+    );
+    for (const item of queue) {
+      await copyMessage(ticket.userId, item.chatId, item.messageId);
+    }
+    const fresh = (await getTicket(ticket.id)) ?? ticket;
+    await syncTopicName(fresh);
+    await noteInTopic(fresh, '📬 Клиент вернулся — недоставленные ответы досланы.');
+  } catch (err) {
+    console.error('[support] дослать недоставленное не удалось:', err);
+  }
+}
+
+/**
+ * То же самое, когда тикета на руках нет — путь быстрого ответа.
+ *
+ * Одно чтение активного тикета, и только оно: сам `flushUndelivered` дальше
+ * отсекается по полям и в обычном случае в базу больше не ходит.
+ */
+async function flushUndeliveredFor(userId: number): Promise<void> {
+  try {
+    const t = await getActiveTicketForUser(userId);
+    if (t) await flushUndelivered(t);
+  } catch (err) {
+    console.error('[support] дослать недоставленное не удалось:', err);
+  }
 }
 
 /**
@@ -950,8 +1021,29 @@ async function attachAiTranscript(
 // ════════════════════════════════════════════════════════════════════
 
 /**
+ * Человек заблокировал бота (или удалил чат).
+ *
+ * Отличать это от прочих отказов Telegram обязательно: «bot was blocked» —
+ * состояние, которое пройдёт само, когда человек вернётся, и ответ надо
+ * сохранить. Всё остальное (слишком длинное сообщение, битая разметка) —
+ * наша поломка здесь и сейчас, и складывать её в очередь незачем.
+ */
+function isBlockedByUser(description?: string): boolean {
+  const d = (description || '').toLowerCase();
+  return (
+    d.includes('bot was blocked') ||
+    d.includes('user is deactivated') ||
+    d.includes('chat not found') ||
+    d.includes('bot can\'t initiate conversation')
+  );
+}
+
+/**
  * Отнести сообщение оператора клиенту. Успех помечаем реакцией 👌 на самом
  * сообщении; если реакции в чате запрещены — короткой строкой.
+ *
+ * Отказ доставки больше не означает потерю ответа: см. `noteUndelivered` и
+ * `flushUndelivered`.
  */
 async function deliverOperatorMessage(ticket: Ticket, msg: TgMessage): Promise<boolean> {
   let t = ticket;
@@ -965,10 +1057,24 @@ async function deliverOperatorMessage(ticket: Ticket, msg: TgMessage): Promise<b
 
   const res = await copyMessage(t.userId, msg.chat.id, msg.message_id);
   if (!res.ok) {
-    await sendMessage(msg.chat.id, `⚠️ Не доставлено: ${escapeHtml(res.description || 'ошибка')}`, {
-      parse_mode: 'HTML',
-      message_thread_id: msg.message_thread_id,
-    });
+    const blocked = isBlockedByUser(res.description);
+    if (blocked) {
+      // Ответ не выбрасываем: он уйдёт первым же сообщением человека, когда
+      // тот разблокирует бота. Имя темы при этом становится 🚫 — иначе
+      // оператор пишет в неё второй и третий раз, не понимая, почему тишина.
+      const marked = await noteUndelivered(t.id, msg.chat.id, msg.message_id);
+      if (marked) await syncTopicName(marked);
+    }
+    await sendMessage(
+      msg.chat.id,
+      blocked
+        ? '🚫 Клиент заблокировал бота. Ответ сохранён и уйдёт ему автоматически, как только он напишет снова.'
+        : `⚠️ Не доставлено: ${escapeHtml(res.description || 'ошибка')}`,
+      {
+        parse_mode: 'HTML',
+        message_thread_id: msg.message_thread_id,
+      },
+    );
     return false;
   }
 

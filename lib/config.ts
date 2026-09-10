@@ -88,6 +88,37 @@ function parseAiAccess(): { everyone: boolean; ids: readonly number[] } {
 const aiAccess = parseAiAccess();
 
 /**
+ * Кому помощник отвечает САМ, когда оператор молчит слишком долго.
+ *
+ * Разбор выгрузки: молчание после передачи оператору — самая массовая строка и
+ * единственная, где мы не отвечаем вообще. Хуже того, нажав «связаться с
+ * оператором», человек попадает в `disableAiMode` — помощника ему выключили, а
+ * оператор молчит.
+ *
+ * Но это НОВОЕ поведение, которое пишет живым клиентам, а такое у нас
+ * выкатывается по правилу «сначала владельцу, потом всем». Поэтому запор
+ * устроен как у «Быстрого ответа», только УМОЛЧАНИЕ обратное: по умолчанию
+ * автоответ получает один владелец. `all` или `*` открывает всем, список
+ * чисел — только им, `off` гасит совсем (напоминание оператору при этом
+ * остаётся: оно клиенту ничего не шлёт).
+ */
+function parseStaleAiAccess(): { off: boolean; everyone: boolean; ids: readonly number[] } {
+  const raw = (process.env.SUPPORT_STALE_AI_USER_IDS || '').trim().toLowerCase();
+  if (raw === 'off' || raw === '0') return { off: true, everyone: false, ids: [] };
+  if (raw === '*' || raw === 'all') return { off: false, everyone: true, ids: [] };
+  if (!raw) return { off: false, everyone: false, ids: [OWNER_USER_ID] };
+
+  const ids = raw
+    .split(',')
+    .map((x) => parseInt(x.trim(), 10))
+    .filter((n) => Number.isFinite(n) && n > 0);
+  // Переменная задана, но не разобралась — считаем, что запор на месте.
+  return { off: false, everyone: false, ids: ids.length > 0 ? ids : [OWNER_USER_ID] };
+}
+
+const staleAiAccess = parseStaleAiAccess();
+
+/**
  * Общий ключ к внутренним ручкам сайта — то же значение, что в окружении
  * сайта.
  *
@@ -142,6 +173,42 @@ export const config = {
 
   internalApiKey,
   aiAccess,
+
+  /**
+   * Общий ключ кронов Vercel. Пусто — ручка крона отвечает 401 и ничего не
+   * делает: открытая ручка, которая пишет клиентам, недопустима.
+   */
+  cronSecret: (process.env.CRON_SECRET || '').trim(),
+
+  staleAiAccess,
+
+  /**
+   * Через сколько минут молчания отвечает помощник.
+   *
+   * Сорок пять — заметно дольше нормального времени ответа оператора и
+   * заметно короче того, после которого человек уходит. Меньше получаса
+   * означало бы перебивать живой разговор, больше часа — отвечать тому, кто
+   * уже закрыл чат.
+   */
+  staleAiMinutes: envInt('SUPPORT_STALE_AI_MINUTES', 45),
+
+  /** С какого возраста тикет попадает в дайджест оператору, часов. */
+  staleDigestHours: envInt('SUPPORT_STALE_DIGEST_HOURS', 12),
+
+  /**
+   * Через сколько часов молчания оператор получает ЛИЧНЫЙ пинг по тикету.
+   *
+   * Две. Дайджест приходит раз в `staleDigestHours` и держит ОДИН общий замок
+   * на тот же срок: тикет, перешагнувший порог через десять минут после
+   * рассылки, попадал бы в следующую почти через сутки — ровно та картина, что
+   * в выгрузке («трое ждут больше суток»). Между 45 минутами автоответа и
+   * дайджестом у оператора не было ни одного сигнала.
+   *
+   * Это ПОРОГ, а не частота: замок у пинга потикетный и держится сутки
+   * (PING_LOCK_HOURS в app/api/cron/stale/route.ts), поэтому один тикет
+   * тревожит оператора один раз, а не каждые два часа, пока висит.
+   */
+  staleFirstPingHours: envInt('SUPPORT_STALE_PING_HOURS', 2),
 } as const;
 
 export function isAdmin(userId: number): boolean {
@@ -155,6 +222,20 @@ export function isAdmin(userId: number): boolean {
  * Порядок важен — без ключа кнопка не появляется НИ У КОГО, включая владельца:
  * кнопка, которая отвечает «недоступно», хуже её отсутствия.
  */
+/**
+ * Отвечать ли этому человеку помощником, когда оператор молчит.
+ *
+ * Два условия и оба обязательны, как у кнопки: ключ к сайту настроен и человек
+ * допущен. Без ключа обращаться некуда, и попытка кончилась бы записью в
+ * журнал вместо ответа.
+ */
+export function staleAutoAnswerEnabled(userId: number): boolean {
+  if (!config.internalApiKey) return false;
+  if (config.staleAiAccess.off) return false;
+  if (config.staleAiAccess.everyone) return true;
+  return config.staleAiAccess.ids.includes(userId);
+}
+
 export function aiQuickAnswerEnabled(userId: number): boolean {
   if (!config.internalApiKey) return false;
   if (config.aiAccess.everyone) return true;

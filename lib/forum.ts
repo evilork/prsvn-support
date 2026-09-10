@@ -41,8 +41,15 @@ const MIGRATE_LAST = 10;
 /** Цвет значка темы — синий, как у Telegram по умолчанию для служебного. */
 const TOPIC_COLOR = 0x6fb9f0;
 
+/**
+ * Имя темы. Значок — состояние тикета одним взглядом по списку тем.
+ *
+ * 🚫 добавлен 10.09.2026: клиент заблокировал бота, и ответ оператора
+ * доставить НЕВОЗМОЖНО. Без этого признака тема выглядела обычной ждущей, и
+ * оператор писал в неё второй и третий раз, не понимая, почему тишина.
+ */
 export function topicName(t: Ticket): string {
-  const state = t.status === 'closed' ? '✅' : isWaiting(t) ? '🔴' : '🟢';
+  const state = t.status === 'closed' ? '✅' : t.blocked ? '🚫' : isWaiting(t) ? '🔴' : '🟢';
   const name = (t.firstName + (t.lastName ? ' ' + t.lastName : '')).trim().slice(0, 40) || 'без имени';
   const user = t.username ? ` @${t.username}` : '';
   return `${state} #${t.id} · ${name}${user}`;
@@ -167,10 +174,15 @@ export async function refreshTopicCard(ticket: Ticket): Promise<void> {
 export async function noteInTopic(
   ticket: Ticket,
   text: string,
+  opts: { notify?: boolean } = {},
 ): Promise<TgResponse<{ message_id: number }> | null> {
   if (!config.groupId || !ticket.threadId) return null;
   return sendHtmlOrPlain(config.groupId, text, {
     message_thread_id: ticket.threadId,
-    disable_notification: true,
+    // Беззвучно — по умолчанию: служебных строк много, и звонить на каждую
+    // значит приучить не смотреть на них вовсе. Исключение задаётся явно и
+    // сейчас ровно одно: «помощник ответил вместо вас» — единственный случай,
+    // где оператор обязан узнать сразу, иначе он ответит второе то же самое.
+    disable_notification: opts.notify !== true,
   });
 }

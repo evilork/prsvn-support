@@ -26,6 +26,44 @@ export interface Ticket {
   lastClientAt?: number;
   /** Когда оператор отвечал в последний раз. */
   lastOperatorAt?: number;
+  /**
+   * С какого момента тикет ждёт ответа НЕПРЕРЫВНО.
+   *
+   * Не то же самое, что `lastClientAt`: человек, написавший четыре сообщения
+   * подряд за час, ждёт с первого, а не с последнего. Считая по последнему, мы
+   * обнуляли бы ожидание каждым его «ну что там?» — то есть ровно у самых
+   * настойчивых, у тех, кто и попадает в разбор с «Поддержка Ваша говно».
+   * Ставится при переходе «отвечен → ждёт», снимается ответом оператора.
+   */
+  waitingSince?: number;
+  /**
+   * Последняя реплика клиента текстом (обрезана).
+   *
+   * Нужна крону тихих тикетов: чтобы помощник ответил вместо молчания, ему
+   * нужен сам вопрос, а в тикете до сих пор лежал только `message_id`.
+   * Вложения сюда не попадают — по ним отвечать вслепую нечего.
+   */
+  lastClientText?: string;
+  /** Когда помощник ответил вместо молчания. Ставится один раз на тикет. */
+  autoAnsweredAt?: number;
+  /**
+   * Клиент заблокировал бота: ответ оператора доставить невозможно.
+   *
+   * Флаг нужен ИМЕННО в тикете, а не только в журнале: до 10.09.2026
+   * недоставленный ответ просто терялся — оператор видел «⚠️ Не доставлено» и
+   * шёл дальше, а человек оставался с тишиной и был уверен, что ему не
+   * ответили. Снимается первым же сообщением клиента.
+   */
+  blocked?: boolean;
+  /**
+   * Ответы оператора, которые не доехали. Дошлём, когда человек напишет снова.
+   *
+   * Храним не текст, а ССЫЛКУ на сообщение оператора (чат и номер): ответ
+   * бывает картинкой или пересланным сообщением, и текстовая копия потеряла бы
+   * ровно то, ради чего его прислали. Копирование по ссылке — тот же путь,
+   * которым ответ шёл в первый раз.
+   */
+  pendingOperator?: { chatId: number; messageId: number; at: number }[];
 }
 
 const K = {
@@ -86,13 +124,25 @@ export async function createTicket(user: TgUser): Promise<Ticket> {
 export async function touchTicket(
   ticketId: number,
   lastUserMsgId?: number,
+  text?: string,
 ): Promise<Ticket | null> {
   const t = await getTicket(ticketId);
   if (!t) return null;
+  // Отметку начала ожидания ставим на переходе «отвечен → ждёт» И тогда, когда
+  // её ещё нет. Второе условие — не перестраховка: без него отметка не
+  // появлялась НИКОГДА у тикета, на который оператор ещё ни разу не отвечал.
+  // `isWaiting` у свежесозданного тикета уже true (`lastClientAt ?? updatedAt`
+  // больше нуля), поэтому «только на переходе» означало «только со второго
+  // круга», а до первого ответа оператора счётчик падал на запасной путь
+  // `lastClientAt` — то есть обнулялся каждым «ну что там?» ровно у самых
+  // настойчивых, у тех, ради кого всё и делалось.
+  if (!t.waitingSince || !isWaiting(t)) t.waitingSince = Date.now();
   t.updatedAt = Date.now();
   t.lastClientAt = t.updatedAt;
   t.messagesCount += 1;
   if (lastUserMsgId) t.lastUserMsgId = lastUserMsgId;
+  // Больше 600 знаков помощнику не нужно, а тикет лежит полгода.
+  if (typeof text === 'string' && text.trim()) t.lastClientText = text.trim().slice(0, 600);
   await Promise.all([
     saveTicket(t),
     redis.zadd(K.openZSet, { score: t.updatedAt, member: String(ticketId) }),
@@ -116,6 +166,10 @@ export async function markOperatorReply(ticketId: number): Promise<Ticket | null
   await disableAiMode(t.userId);
   t.lastOperatorAt = Date.now();
   t.updatedAt = t.lastOperatorAt;
+  // Ожидание закончилось — и вместе с ним право крона напоминать про этот
+  // тикет. Право ответить помощником тоже: `autoAnsweredAt` не сбрасываем,
+  // один автоответ на тикет и есть потолок.
+  t.waitingSince = undefined;
   await Promise.all([
     saveTicket(t),
     // Ответ оператора — тоже активность: иначе тикет, где последним писал
@@ -175,6 +229,12 @@ export async function reopenTicket(ticketId: number) {
   t.status = 'open';
   t.updatedAt = now;
   t.closedAt = undefined;
+  // Ожидание отсчитывается ЗАНОВО. Тикет мог пролежать закрытым неделю, и
+  // старая отметка означала бы «ждёт 168 часов» в ту же секунду: дайджест
+  // получил бы его первым, а автоответ не получил бы вовсе — тот отсекает
+  // старше 12 часов. Закрытый тикет никого не заставлял ждать.
+  if (t.lastClientAt && t.lastClientAt > (t.lastOperatorAt ?? 0)) t.waitingSince = now;
+  else t.waitingSince = undefined;
   await Promise.all([
     saveTicket(t),
     redis.zrem(K.closedZSet, String(ticketId)),
@@ -352,4 +412,189 @@ export async function acquireTemplateSendLock(ticketId: number, key: string): Pr
 
 export async function releaseTemplateSendLock(ticketId: number, key: string): Promise<void> {
   await redis.del(K.tplLock(ticketId, key));
+}
+
+// ─── тикеты, которые ждут ответа ───────────────────────────
+//
+// До 10.09.2026 «ждёт ответа» жило ровно в двух местах: значке 🔴 в имени темы
+// и в счётчике на панели админа. Оба читаются, только когда оператор сам придёт
+// и посмотрит. Механизма, который НАПОМНИТ, не было ни одного — в vercel.json
+// бота не было ни строчки про кроны. На конец разбираемой выгрузки без ответа
+// висели 14 тикетов, трое ждали больше суток.
+
+/** Сколько тикетов разбирает один проход крона. */
+const WAITING_SCAN_LIMIT = 300;
+
+export interface WaitingTicket {
+  ticket: Ticket;
+  /** Сколько ждёт, мс. */
+  waitedMs: number;
+}
+
+/**
+ * Открытые тикеты, ждущие ответа оператора дольше `minMs`.
+ *
+ * Читаем ZSET открытых пачкой, а не по одному: у крона на всё меньше минуты, а
+ * одно обращение к базе из Вирджинии во Франкфурт стоит около ста миллисекунд.
+ *
+ * Старые тикеты без `waitingSince` (заведены до этой правки) считаем ждущими с
+ * `lastClientAt`: это ровно прежнее поведение `isWaiting`, только с числом.
+ *
+ * Возвращает от старых к новым — в том же порядке они и нужны оператору.
+ */
+export async function listWaitingTickets(
+  minMs: number,
+  now = Date.now(),
+  limit = WAITING_SCAN_LIMIT,
+): Promise<WaitingTicket[]> {
+  const ids = await redis.zrange<string[]>(K.openZSet, 0, now, {
+    byScore: true,
+    offset: 0,
+    count: limit,
+  });
+  if (!ids || ids.length === 0) return [];
+
+  const raws = await redis.mget<(Ticket | null)[]>(
+    ...ids.map((id) => K.ticket(parseInt(String(id), 10))),
+  );
+
+  const out: WaitingTicket[] = [];
+  for (const t of raws || []) {
+    if (!t || !isWaiting(t)) continue;
+    // Заблокировавшего бота пропускаем целиком. Ему физически нельзя ничего
+    // доставить: автоответ ушёл бы в пустоту и сжёг единственную попытку на
+    // тикет, а в дайджесте он стоял бы вечно — «#223 — 19 ч», «#223 — 31 ч» —
+    // про человека, которому нечего написать. Признак снимается его же первым
+    // сообщением (`takeUndelivered`), и тикет вернётся в список сам.
+    if (t.blocked) continue;
+    const since = t.waitingSince ?? t.lastClientAt ?? t.updatedAt;
+    const waitedMs = now - since;
+    if (waitedMs >= minMs) out.push({ ticket: t, waitedMs });
+  }
+  out.sort((a, b) => b.waitedMs - a.waitedMs);
+  return out;
+}
+
+/**
+ * Пометить, что помощник ответил вместо молчания. `false` — уже отвечал.
+ *
+ * Проверка и отметка одним чтением-записью того же тикета: крон ходит раз в
+ * четверть часа, и два прохода подряд не должны дать человеку два автоответа.
+ */
+export async function claimAutoAnswer(ticketId: number, now = Date.now()): Promise<boolean> {
+  const t = await getTicket(ticketId);
+  if (!t || t.status !== 'open' || t.autoAnsweredAt) return false;
+  t.autoAnsweredAt = now;
+  await saveTicket(t);
+  return true;
+}
+
+/**
+ * Вернуть отметку: помощник так и не сказал человеку ни слова.
+ *
+ * Нужна там, где неудача ВРЕМЕННАЯ и повтор через четверть часа осмыслен:
+ * ручка сайта ответила 429 по суточному или минутному лимиту, Telegram не
+ * принял сообщение. Без отката единственная попытка на тикет сгорала на
+ * стороннем отказе, и человек не получал ничего уже никогда.
+ *
+ * Отказ самой модели откатывать НЕ надо: он повторится и стоит денег.
+ */
+export async function releaseAutoAnswer(ticketId: number): Promise<void> {
+  const t = await getTicket(ticketId);
+  if (!t || !t.autoAnsweredAt) return;
+  t.autoAnsweredAt = undefined;
+  await saveTicket(t);
+}
+
+/**
+ * Персональный пинг оператору по одному тикету — не чаще раза в `hours`.
+ *
+ * Замок ПО ТИКЕТУ, в отличие от дайджеста: тот держит один глобальный ключ, и
+ * тикет, перешагнувший порог через десять минут после рассылки, ждал бы
+ * следующей почти полные сутки. Здесь каждый тикет со своим сроком.
+ *
+ * Сбой базы — молчим: лишний пинг каждые пятнадцать минут про один и тот же
+ * тикет приучил бы не читать их вовсе.
+ */
+export async function claimTicketPing(ticketId: number, hours: number): Promise<boolean> {
+  try {
+    const first = await redis.set(`support:ticketping:${ticketId}`, Date.now(), {
+      nx: true,
+      ex: Math.max(60, Math.round(hours * 3600)),
+    });
+    return first !== null;
+  } catch (err) {
+    console.error('[support] ticket ping claim failed:', err);
+    return false;
+  }
+}
+
+/** Пометить тикет недоставляемым, когда об этом сказал Telegram. */
+export async function markBlocked(ticketId: number): Promise<Ticket | null> {
+  const t = await getTicket(ticketId);
+  if (!t || t.blocked) return t;
+  t.blocked = true;
+  await saveTicket(t);
+  return t;
+}
+
+/** Один дайджест на `hours` часов, а не на каждый проход крона. */
+export async function claimStaleDigest(hours: number): Promise<boolean> {
+  try {
+    const first = await redis.set('support:staledigest', Date.now(), {
+      nx: true,
+      ex: Math.max(1, Math.round(hours * 3600)),
+    });
+    return first !== null;
+  } catch (err) {
+    // Сбой базы — молчим: лишний дайджест раз в пятнадцать минут приучил бы
+    // не читать его вовсе, а это единственное напоминание, которое у нас есть.
+    console.error('[support] digest claim failed:', err);
+    return false;
+  }
+}
+
+// ─── недоставленные ответы оператора ───────────────────────
+
+/** Сколько недоставленных ответов помним на тикет. */
+const PENDING_OPERATOR_CAP = 5;
+
+/**
+ * Ответ оператора не доехал (человек заблокировал бота) — запомнить и пометить.
+ *
+ * Раньше такой ответ терялся совсем: оператор видел «⚠️ Не доставлено» и шёл
+ * дальше, а человек оставался с тишиной и был уверен, что ему не ответили.
+ */
+export async function noteUndelivered(
+  ticketId: number,
+  chatId: number,
+  messageId: number,
+): Promise<Ticket | null> {
+  const t = await getTicket(ticketId);
+  if (!t) return null;
+  const queue = [...(t.pendingOperator ?? []), { chatId, messageId, at: Date.now() }];
+  t.pendingOperator = queue.slice(-PENDING_OPERATOR_CAP);
+  t.blocked = true;
+  await saveTicket(t);
+  return t;
+}
+
+/**
+ * Забрать накопленные недоставленные ответы и снять признак блокировки.
+ *
+ * Забираем ДО отправки: повторная доставка одного и того же ответа выглядит
+ * как второй ответ на тот же вопрос, а потеря при сбое возвращает нас к
+ * прежнему поведению, которое мы и так считаем терпимым.
+ */
+export async function takeUndelivered(
+  ticketId: number,
+): Promise<{ chatId: number; messageId: number; at: number }[]> {
+  const t = await getTicket(ticketId);
+  if (!t) return [];
+  const queue = t.pendingOperator ?? [];
+  if (queue.length === 0 && !t.blocked) return [];
+  t.pendingOperator = undefined;
+  t.blocked = false;
+  await saveTicket(t);
+  return queue;
 }
