@@ -69,6 +69,22 @@ test("thanks with a real problem after an operator reply waits", () => {
   assert.equal(t.lastClientAckAt, undefined);
 });
 
+test("distress emoji, a sad sticker or an interrobang after an operator reply wait", () => {
+  for (const text of ["🆘", "⏳", "спасибо⁉️", "работает 😐"]) {
+    const t = answeredTicket();
+    const at = T0 + 20 * MIN;
+    assert.equal(send(t, text, at), "waiting", text);
+    assert.equal(isWaiting(t), true, text);
+    assert.equal(t.lastClientAckAt, undefined, text);
+  }
+  for (const emoji of ["😔", "🤦‍♂️"]) {
+    const t = answeredTicket();
+    const closing = isClosingMessage({ sticker: { file_id: "x", emoji } });
+    assert.equal(applyClientMessage(t, { now: T0 + 20 * MIN, messageId: 100, closing }), "waiting", emoji);
+    assert.equal(isWaiting(t), true, emoji);
+  }
+});
+
 test("a question after an acknowledgement starts waiting from the question", () => {
   const t = answeredTicket();
   send(t, "👍", T0 + 20 * MIN);

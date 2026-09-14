@@ -38,8 +38,46 @@ test("English thanks and acknowledgements close", () => {
 });
 
 test("emoji-only positive replies close", () => {
-  for (const text of ["👍", "🙏🙏", "❤️", "👌 👍"]) {
+  for (const text of ["👍", "🙏🙏", "❤️", "👌 👍", "👍🏻", "🙏🏽🙏🏽", "❤️‍🔥", "✅", "☺️", "🫶🏼"]) {
     assert.equal(isClosingRemark(text), true, text);
+  }
+});
+
+test("thanks with a positive emoji closes", () => {
+  for (const text of ["спасибо 🙏🏽", "Всё работает ✅", "thanks 👍🏿", "спасибо!!! ❤️❤️"]) {
+    assert.equal(isClosingRemark(text), true, text);
+  }
+});
+
+test("emoji outside the allowlist wait: distress, waiting, sadness, shrugging", () => {
+  for (const text of [
+    "🆘", "❗", "⁉️", "‼️", "⏳", "🔴", "😔", "😩", "😱", "🥲",
+    "🤦‍♂️", "🤦", "🤷", "🙄", "😐", "💔", "💀", "👀", "😂", "🇷🇺",
+    "👍🆘", "🙏 😔",
+  ]) {
+    assert.equal(isClosingRemark(text), false, text);
+  }
+});
+
+test("thanks mixed with an emoji outside the allowlist waits", () => {
+  for (const text of [
+    "работает 😐",
+    "ok 🙄",
+    "спасибо 🤦",
+    "ок, понял 😔",
+    "ok 🤷",
+    "спасибо ⏳",
+    "спасибо⁉️",
+    "спасибо‽",
+    "спасибо ‼️",
+  ]) {
+    assert.equal(isClosingRemark(text), false, text);
+  }
+});
+
+test("thanks next to an unclear symbol waits", () => {
+  for (const text of ["спасибо +", "спасибо <3", "ок 1️⃣", "спасибо ₽"]) {
+    assert.equal(isClosingRemark(text), false, text);
   }
 });
 
@@ -115,8 +153,15 @@ test("isClosingMessage: captions on media never close", () => {
 
 test("isClosingMessage: stickers are judged by their emoji", () => {
   assert.equal(isClosingMessage({ sticker: { file_id: "x", emoji: "👍" } }), true);
+  assert.equal(isClosingMessage({ sticker: { file_id: "x", emoji: "👍🏻" } }), true);
   assert.equal(isClosingMessage({ sticker: { file_id: "x", emoji: "👎" } }), false);
   assert.equal(isClosingMessage({ sticker: { file_id: "x" } }), false);
+});
+
+test("isClosingMessage: stickers outside the allowlist wait", () => {
+  for (const emoji of ["😿", "🆘", "😔", "🤦‍♂️", "⏳"]) {
+    assert.equal(isClosingMessage({ sticker: { file_id: "x", emoji } }), false, emoji);
+  }
 });
 
 test("isClosingMessage: no text and no sticker waits", () => {

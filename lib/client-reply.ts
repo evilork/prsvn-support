@@ -16,6 +16,11 @@
 // «но» and «не», which are not in the vocabulary at all. Anything we are not
 // sure about counts as a question, exactly as before.
 //
+// Emoji follow the same rule: an allowlist, not a denylist. EVERY pictograph in
+// the message, alone, next to words or as a sticker's emoji, must be a clearly
+// positive one (👍 🙏 ❤️ ✅ 🙂 …). A denylist missed 🆘, ⏳, 😔, 🤦‍♂️ and the rest
+// of the thousands of emoji, and each miss swallowed a complaint.
+//
 // «Да», «нет», «ага» are left out on purpose: they answer an operator's question
 // («у вас iPhone?»), and after them the operator has to continue.
 
@@ -58,25 +63,71 @@ const CLOSING_FILLER: ReadonlySet<string> = new Set([
   'you', 'so', 'very', 'much', 'a', 'lot', 'now', 'it', 'all',
 ]);
 
-/** Emoji after which the ticket must keep waiting: displeasure, "something is off". */
-const NEGATIVE_EMOJI = /[👎😡😠🤬😤😢😭😞😟🙁☹😕😒💩🤔❌⛔🚫⚠]/u;
+/**
+ * Emoji modifiers and joiners: skin tones, VS15/VS16, ZWJ. Removed before the
+ * allowlist check, so 👍🏻 is compared as 👍, ❤️ as ❤ and 🤦‍♂️ as 🤦 + ♂.
+ */
+const EMOJI_JOINERS = /[‍︎️\u{1F3FB}-\u{1F3FF}]/gu;
 
-/** Question marks in any spelling, emoji included. */
-const QUESTION_MARK = /[?？¿❓❔]/u;
+/**
+ * The only pictographs a closing remark may contain: approval, thanks, joy.
+ * Everything else, including 🆘 ⏳ ❗ ‼️ 😔 😐 🙄 🤦 🤷 💔 👀 and ones added to
+ * Unicode later, keeps the ticket waiting. Laughter (😂 😅) and winks are left
+ * out on purpose: they are just as often sarcasm or embarrassment.
+ * Stored without joiners, so a pasted ❤️ with VS16 still matches.
+ */
+const POSITIVE_EMOJI: ReadonlySet<string> = new Set(
+  [
+    '👍', '👌', '🙏', '🤝', '🫶', '👏', '💪', '🫡',
+    '❤', '♥', '🧡', '💛', '💚', '💙', '💜', '🤍', '💖', '💗', '💕',
+    '✅', '✔', '☑', '💯', '🔥', '🎉', '🥳', '✨',
+    '🙂', '😊', '☺', '😀', '😃', '😄', '😁', '🥰', '😍', '🤗',
+  ].map((e) => e.replace(EMOJI_JOINERS, '')),
+);
+
+/** Question marks in any spelling, emoji and the interrobang included. */
+const QUESTION_MARK = /[?？¿❓❔⁉‽]/u;
 
 const PICTOGRAPHIC = /\p{Extended_Pictographic}/u;
 
+/** Letters, digits, punctuation and spaces: judged by the word check instead. */
+const PLAIN_CHAR = /[\p{L}\p{N}\p{P}\s]/u;
+
 /**
- * A short thank-you, "ok", «всё работает», or emoji only.
+ * Check every character outside words and punctuation.
+ *
+ * `'none'` — no pictographs at all; `'positive'` — only allowlisted ones;
+ * `'uncertain'` — any other pictograph or symbol: a non-allowlisted emoji, a
+ * flag, a keycap, «+», «<3», a currency sign. We do not guess what those mean.
+ * O(n) in the message length, which is capped at MAX_CHARS.
+ */
+function classifySymbols(text: string): 'none' | 'positive' | 'uncertain' {
+  let positive = false;
+  for (const ch of text.replace(EMOJI_JOINERS, '')) {
+    if (PICTOGRAPHIC.test(ch)) {
+      if (!POSITIVE_EMOJI.has(ch)) return 'uncertain';
+      positive = true;
+    } else if (!PLAIN_CHAR.test(ch)) {
+      return 'uncertain';
+    }
+  }
+  return positive ? 'positive' : 'none';
+}
+
+/**
+ * A short thank-you, "ok", «всё работает», or positive emoji only.
  *
  * `false` for anything uncertain: a question, a negation, a number, a link, any
- * word outside the vocabulary, a long text, a displeased emoji.
+ * word outside the vocabulary, a long text, any emoji outside the allowlist.
  */
 export function isClosingRemark(text: string): boolean {
   if (typeof text !== 'string') return false;
   const trimmed = text.trim();
   if (trimmed === '' || trimmed.length > MAX_CHARS) return false;
-  if (QUESTION_MARK.test(trimmed) || NEGATIVE_EMOJI.test(trimmed)) return false;
+  if (QUESTION_MARK.test(trimmed)) return false;
+
+  const symbols = classifySymbols(trimmed);
+  if (symbols === 'uncertain') return false;
 
   const words = trimmed
     .toLowerCase()
@@ -85,7 +136,7 @@ export function isClosingRemark(text: string): boolean {
     .filter((w) => w !== '');
 
   // Emoji only: 👍, 🙏🙏, ❤️. Without a pictograph («)))», «...») we are not sure.
-  if (words.length === 0) return PICTOGRAPHIC.test(trimmed);
+  if (words.length === 0) return symbols === 'positive';
 
   if (words.length > MAX_WORDS) return false;
   let hasCore = false;
@@ -101,8 +152,9 @@ export function isClosingRemark(text: string): boolean {
  *
  * Plain text and stickers only. A caption on a photo or file is not a thank-you:
  * a screenshot captioned «спасибо» may show the very error being discussed. A
- * sticker is judged by its emoji: a thumbs-down sticker carries 👎. A sticker
- * without an emoji is uncertain, so the ticket waits.
+ * sticker is judged by its emoji against the same allowlist: a 👍 sticker
+ * closes, a 😿 or 🆘 one does not. A sticker without an emoji is uncertain, so
+ * the ticket waits.
  */
 export function isClosingMessage(msg: Pick<TgMessage, 'text' | 'caption' | 'sticker'>): boolean {
   if (msg.sticker) {
