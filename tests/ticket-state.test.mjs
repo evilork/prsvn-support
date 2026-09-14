@@ -148,6 +148,20 @@ test("legacy ticket without lastClientAt stays answered after thanks", () => {
   assert.equal(isWaiting(t), false);
   assert.equal(send(t, "спасибо", T0 + 20 * MIN), "acknowledged");
   assert.equal(isWaiting(t), false);
+  // No invented client time: the card would show it as «клиент писал».
+  assert.equal(t.lastClientAt, undefined);
+  assert.equal(t.lastClientAckAt, T0 + 20 * MIN);
+
+  // A later real question still waits, from the question.
+  assert.equal(send(t, "опять не работает", T0 + 40 * MIN), "waiting");
+  assert.equal(isWaiting(t), true);
+  assert.equal(t.waitingSince, T0 + 40 * MIN);
+});
+
+test("isWaiting: a legacy ticket keeps the updatedAt fallback until a closing remark", () => {
+  const legacy = { status: "open", updatedAt: T0 + 20 * MIN, lastOperatorAt: T0 + 10 * MIN };
+  assert.equal(isWaiting(legacy), true);
+  assert.equal(isWaiting({ ...legacy, lastClientAckAt: T0 + 20 * MIN }), false);
 });
 
 test("closed ticket is never acknowledged", () => {

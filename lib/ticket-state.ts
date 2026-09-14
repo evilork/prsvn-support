@@ -9,12 +9,22 @@ import type { Ticket } from './tickets';
 /** How much of the client's last text is stored for the stale cron. */
 const CLIENT_TEXT_MAX = 600;
 
-export type WaitFields = Pick<Ticket, 'status' | 'updatedAt' | 'lastClientAt' | 'lastOperatorAt'>;
+export type WaitFields = Pick<
+  Ticket,
+  'status' | 'updatedAt' | 'lastClientAt' | 'lastOperatorAt' | 'lastClientAckAt'
+>;
 
-/** Ждёт ли тикет ответа оператора. Старые тикеты без отметок считаем ждущими. */
+/**
+ * Ждёт ли тикет ответа оператора. Старые тикеты без отметок считаем ждущими.
+ *
+ * The `updatedAt` fallback for legacy tickets without `lastClientAt` is not used
+ * once the client has sent a closing remark (`lastClientAckAt`): that remark
+ * moved `updatedAt` but asked nothing, and no real question has been recorded
+ * since (a real one would have set `lastClientAt`).
+ */
 export function isWaiting(t: WaitFields): boolean {
   if (t.status !== 'open') return false;
-  const client = t.lastClientAt ?? t.updatedAt;
+  const client = t.lastClientAt ?? (t.lastClientAckAt === undefined ? t.updatedAt : 0);
   return client > (t.lastOperatorAt ?? 0);
 }
 
@@ -55,11 +65,11 @@ export function applyClientMessage(t: Ticket, msg: ClientMessage): ClientMessage
   if (msg.messageId) t.lastUserMsgId = msg.messageId;
 
   if (msg.closing && answered) {
+    // On a legacy ticket without `lastClientAt` this mark also stops isWaiting
+    // from falling back to the `updatedAt` just moved. `lastClientAt` is left
+    // alone: the card shows it as «клиент писал N назад», and a copy of the
+    // operator's time there would be a false fact.
     t.lastClientAckAt = msg.now;
-    // Legacy ticket without `lastClientAt`: isWaiting would now fall back to the
-    // `updatedAt` just moved and report "waiting". Pin the client mark to the
-    // operator reply this remark answers.
-    if (t.lastClientAt === undefined) t.lastClientAt = t.lastOperatorAt;
     return 'acknowledged';
   }
 
