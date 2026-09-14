@@ -106,6 +106,25 @@ test("thanks on a ticket no operator has answered yet still waits", () => {
   assert.equal(t.lastClientText, "не работает");
 });
 
+test("a fresh ticket with only a thank-you waits and keeps that text for the ping", () => {
+  // Shaped like createTicket: a «спасибо» sent after /close opens a new ticket.
+  const t = { id: 3, userId: 9, firstName: "Late", status: "open", createdAt: T0, updatedAt: T0, messagesCount: 0 };
+  assert.equal(send(t, "спасибо", T0 + MIN), "waiting");
+
+  assert.equal(isWaiting(t), true);
+  assert.equal(t.lastClientText, "спасибо");
+  assert.equal(t.waitingSince, T0 + MIN);
+});
+
+test("a real question replaces a stored thank-you", () => {
+  const t = { id: 4, userId: 9, firstName: "Late", status: "open", createdAt: T0, updatedAt: T0, messagesCount: 0 };
+  send(t, "спасибо", T0 + MIN);
+  send(t, "а как продлить", T0 + 2 * MIN);
+  assert.equal(t.lastClientText, "а как продлить");
+  send(t, "ок", T0 + 3 * MIN);
+  assert.equal(t.lastClientText, "а как продлить");
+});
+
 test("thanks while already waiting keeps the wait start and the question", () => {
   const t = answeredTicket();
   send(t, "опять не подключается", T0 + 30 * MIN);

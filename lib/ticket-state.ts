@@ -75,11 +75,14 @@ export function applyClientMessage(t: Ticket, msg: ClientMessage): ClientMessage
   t.lastClientAt = msg.now;
 
   // Больше 600 знаков помощнику не нужно, а тикет лежит полгода.
-  // A closing remark never replaces the stored question: in a ticket that is
-  // still waiting, «спасибо» after «не работает» would otherwise become what the
-  // operator is pinged with and what the model is asked. Links are masked before
-  // storing (audit BS-7, lib/redact.ts).
-  if (!msg.closing && typeof msg.text === 'string') {
+  // A closing remark never replaces a stored question: in a ticket that is still
+  // waiting, «спасибо» after «не работает» would otherwise become what the
+  // operator is pinged with and what the model is asked. With no question stored
+  // yet (a thank-you after /close opens a new ticket) it is kept: a ping with no
+  // text at all makes the operator open the topic just to read «спасибо». The
+  // stale cron does not ask the model about it (`isClosingRemark` there).
+  // Links are masked before storing (audit BS-7, lib/redact.ts).
+  if (typeof msg.text === 'string' && (!msg.closing || !t.lastClientText)) {
     const masked = maskSubscriptionLinks(msg.text.trim()).slice(0, CLIENT_TEXT_MAX);
     if (masked.trim()) t.lastClientText = masked;
   }

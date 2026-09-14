@@ -35,6 +35,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 import { askProxysAi, splitForTelegram } from '@/lib/ai';
+import { isClosingRemark } from '@/lib/client-reply';
 import { config, staleAutoAnswerEnabled } from '@/lib/config';
 import { noteInTopic } from '@/lib/forum';
 import { maskSubscriptionLinks } from '@/lib/redact';
@@ -146,6 +147,8 @@ interface Stats {
   undelivered: number;
   /** Пропущены: последняя реплика — вложение, спрашивать нечего. */
   noQuestion: number;
+  /** Skipped: the only stored text is a thank-you, the model has nothing to answer. */
+  thanksOnly: number;
   /** Личных пингов оператору по отдельным тикетам за проход. */
   pings: number;
   digestTickets: number;
@@ -181,6 +184,13 @@ async function answerOne(t: Ticket, stats: Stats): Promise<void> {
   const question = maskSubscriptionLinks((t.lastClientText || '').trim());
   if (!question) {
     stats.noQuestion += 1;
+    return;
+  }
+  // A ticket whose only text is «спасибо» (sent after /close, it opened a new
+  // ticket): a robot «пожалуйста» hours later answers nothing. The operator still
+  // gets the ping and the digest line with the text and closes it by hand.
+  if (isClosingRemark(question)) {
+    stats.thanksOnly += 1;
     return;
   }
   if (!(await claimAutoAnswer(t.id))) return;
@@ -352,6 +362,7 @@ export async function GET(req: NextRequest) {
     escalated: 0,
     undelivered: 0,
     noQuestion: 0,
+    thanksOnly: 0,
     pings: 0,
     digestTickets: 0,
     digestSent: false,
