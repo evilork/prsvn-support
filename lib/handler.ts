@@ -66,6 +66,7 @@ import {
   type FaqNode,
 } from './faq';
 import { ensureTopic, noteInTopic, relayClientToTopic, reopenTopic, syncTopicName } from './forum';
+import { quickAnswerButton, type QuickAnswerAction } from './quick-answer';
 import {
   answerCallbackQuery,
   copyMessage,
@@ -97,7 +98,7 @@ import {
   touchTicket,
   type Ticket,
 } from './tickets';
-import type { TgCallbackQuery, TgMessage, TgUser, Update } from './types';
+import type { InlineKeyboardButton, TgCallbackQuery, TgMessage, TgUser, Update } from './types';
 
 const RATE_LIMIT_MSG = 'Слишком много сообщений. Подождите минуту.';
 const BANNED_MSG = 'Вы заблокированы в поддержке.';
@@ -301,7 +302,7 @@ async function showClientMenu(userId: number) {
   const root = findNode('menu')!;
   await sendMessage(userId, CLIENT_WELCOME, {
     parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: buildFaqKeyboard(root, { ai: aiQuickAnswerEnabled(userId) }) },
+    reply_markup: { inline_keyboard: buildFaqKeyboard(root, { ai: menuQuickAnswer(userId) }) },
   });
 }
 
@@ -608,6 +609,29 @@ const CONTACT_BUTTON = { text: '🆘 Связаться со специалис�
 const MENU_BUTTON = { text: '🏠 В меню', callback_data: 'faq:menu' } as const;
 
 /**
+ * A quick-answer button for a keyboard sent to this person's private chat.
+ *
+ * Every client keyboard in this file goes to `chat_id = user id`, which is the
+ * private chat — the only place a web_app button is valid, so the chat id is
+ * the user id by construction. The owner gets the ProxysAI Mini App, everyone
+ * else the in-chat assistant with the same label and callback as before (see
+ * lib/quick-answer.ts). The operator group never gets these keyboards.
+ */
+function quickAnswerFor(userId: number, action: QuickAnswerAction): InlineKeyboardButton {
+  return quickAnswerButton(action, { userId, chatId: userId, siteUrl: config.siteUrl });
+}
+
+/**
+ * «⚡ Быстрый ответ» for the FAQ menu, or null when this person does not see it.
+ *
+ * Visibility is still decided by `aiQuickAnswerEnabled` alone, as before; the
+ * Mini App gate only changes what the visible button does.
+ */
+function menuQuickAnswer(userId: number): InlineKeyboardButton | null {
+  return aiQuickAnswerEnabled(userId) ? quickAnswerFor(userId, 'open') : null;
+}
+
+/**
  * Клавиатура под ответом помощника.
  *
  * Кнопки оператора здесь намеренно НЕТ: это окно разговора с помощником, и
@@ -616,11 +640,15 @@ const MENU_BUTTON = { text: '🏠 В меню', callback_data: 'faq:menu' } as c
  * словами, помощник передаёт сам, а «В меню» возвращает туда, где кнопка
  * оператора стоит постоянно. Под ОТКАЗОМ помощника кнопка остаётся — там она
  * единственный путь дальше, см. `aiFallbackKeyboard`.
+ *
+ * For the owner «⚡ Спросить ещё» opens the Mini App: the conversation is shared
+ * with the dashboard, so it continues there. Typing in the chat still works —
+ * the in-chat mode stays on after an answer.
  */
-function aiReplyKeyboard() {
+function aiReplyKeyboard(userId: number) {
   return {
     inline_keyboard: [
-      [{ text: '⚡ Спросить ещё', callback_data: 'ai:more' }],
+      [quickAnswerFor(userId, 'more')],
       [MENU_BUTTON],
     ],
   };
@@ -708,7 +736,7 @@ async function runAttachmentAnswer(
     // Стикер и кость — реплика, а не вопрос. Ни тикета, ни гашения режима:
     // человек сказал «спасибо», и отвечать на это живым оператором значит
     // выключить помощника ровно перед следующим настоящим вопросом.
-    await sendMessage(user.id, attach.reply, { reply_markup: aiReplyKeyboard() });
+    await sendMessage(user.id, attach.reply, { reply_markup: aiReplyKeyboard(user.id) });
     await enableAiMode(user.id);
     return;
   }
@@ -942,7 +970,7 @@ async function runQuickAnswer(
     const last = i === chunks.length - 1;
     // Ответ модели уходит БЕЗ parse_mode: правила запрещают ей разметку, но
     // одна угловая скобка в режиме HTML стоила бы всего сообщения целиком.
-    await sendMessage(user.id, chunks[i], last ? { reply_markup: aiReplyKeyboard() } : {});
+    await sendMessage(user.id, chunks[i], last ? { reply_markup: aiReplyKeyboard(user.id) } : {});
   }
 
   // Режим продлеваем ПОСЛЕ отправки ответа. Наоборот было бы дороже: сбой базы
@@ -1397,7 +1425,7 @@ async function renderFaqNode(chatId: number, messageId: number, node: FaqNode) {
 
   // Клиентское меню всегда живёт в личке, так что chatId здесь — это и есть
   // идентификатор человека, которому решается показать «Быстрый ответ».
-  const keyboard = { inline_keyboard: buildFaqKeyboard(node, { ai: aiQuickAnswerEnabled(chatId) }) };
+  const keyboard = { inline_keyboard: buildFaqKeyboard(node, { ai: menuQuickAnswer(chatId) }) };
 
   const res = await editMessageText(chatId, messageId, text, {
     parse_mode: 'HTML',

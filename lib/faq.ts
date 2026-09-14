@@ -1,6 +1,6 @@
 // lib/faq.ts
 import { config } from './config';
-import type { InlineKeyboard } from './types';
+import type { InlineKeyboard, InlineKeyboardButton } from './types';
 
 export interface FaqNode {
   id: string;
@@ -462,10 +462,16 @@ export function findParent(id: string, node: FaqNode = FAQ_TREE): FaqNode | null
  *
  * `ai` решает, рисовать ли «Быстрый ответ». Признак приходит снаружи, а не
  * считается здесь: клавиатура не знает, КОМУ её показывают, и знать не должна.
- * Значение по умолчанию `false` оставляет прежние вызовы такими, какими они
- * были: кнопки нет, пока её явно не попросили.
+ *
+ * `ai` is the ready button, not a flag: whether it opens the Mini App or the
+ * in-chat assistant depends on who sees it (lib/quick-answer.ts), which is
+ * exactly what this keyboard must not know. Absent or null — no button, so
+ * callers that never asked for one stay as they were.
  */
-export function buildFaqKeyboard(node: FaqNode, opts: { ai?: boolean } = {}): InlineKeyboard {
+export function buildFaqKeyboard(
+  node: FaqNode,
+  opts: { ai?: InlineKeyboardButton | null } = {},
+): InlineKeyboard {
   const rows: InlineKeyboard = [];
 
   if (node.children) {
@@ -488,7 +494,7 @@ export function buildFaqKeyboard(node: FaqNode, opts: { ai?: boolean } = {}): In
   // Живой человек остаётся ниже и никуда не девается — иначе кнопка помощника
   // читалась бы как «оператора больше нет».
   if (opts.ai) {
-    rows.push([{ text: '⚡ Быстрый ответ', callback_data: 'ai' }]);
+    rows.push([opts.ai]);
   }
   rows.push([{ text: '🆘 Связаться со специалистом', callback_data: 'contact' }]);
   return rows;
