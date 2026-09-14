@@ -37,6 +37,7 @@ import { Redis } from '@upstash/redis';
 import { askProxysAi, splitForTelegram } from '@/lib/ai';
 import { config, staleAutoAnswerEnabled } from '@/lib/config';
 import { noteInTopic } from '@/lib/forum';
+import { maskSubscriptionLinks } from '@/lib/redact';
 import { sendMessage } from '@/lib/telegram';
 import {
   claimAutoAnswer,
@@ -175,7 +176,9 @@ interface Stats {
  *     оператору: клиенту сказать нечего, а оператору — есть, и он узнаёт.
  */
 async function answerOne(t: Ticket, stats: Stats): Promise<void> {
-  const question = (t.lastClientText || '').trim();
+  // Masked here too, not only on write: tickets stored before 14.09.2026 live
+  // for 180 days and may still hold a full subscription link (audit BS-7).
+  const question = maskSubscriptionLinks((t.lastClientText || '').trim());
   if (!question) {
     stats.noQuestion += 1;
     return;
@@ -380,7 +383,9 @@ export async function GET(req: NextRequest) {
         x.ticket,
         `⏳ <b>Ждёт ответа ${hoursWord(x.waitedMs)}</b> — #${x.ticket.id} · ${escapeHtml(who(x.ticket))}` +
           (x.ticket.autoAnsweredAt ? '\nПомощник уже отвечал сам.' : '') +
-          (x.ticket.lastClientText ? `\n<i>${escapeHtml(x.ticket.lastClientText.slice(0, 200))}</i>` : ''),
+          (x.ticket.lastClientText
+            ? `\n<i>${escapeHtml(maskSubscriptionLinks(x.ticket.lastClientText).slice(0, 200))}</i>`
+            : ''),
         stats,
       );
     }

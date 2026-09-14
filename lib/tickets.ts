@@ -2,6 +2,7 @@
 import { Redis } from '@upstash/redis';
 import { disableAiMode } from './ai';
 import { config } from './config';
+import { maskSubscriptionLinks } from './redact';
 import type { TgUser } from './types';
 
 const redis = Redis.fromEnv();
@@ -142,7 +143,13 @@ export async function touchTicket(
   t.messagesCount += 1;
   if (lastUserMsgId) t.lastUserMsgId = lastUserMsgId;
   // Больше 600 знаков помощнику не нужно, а тикет лежит полгода.
-  if (typeof text === 'string' && text.trim()) t.lastClientText = text.trim().slice(0, 600);
+  // Mask subscription links BEFORE storing: this text goes to the operator's
+  // ping and to the model, and the link is the access itself (audit BS-7, see
+  // lib/redact.ts).
+  if (typeof text === 'string' && text.trim()) {
+    const masked = maskSubscriptionLinks(text.trim()).slice(0, 600);
+    if (masked) t.lastClientText = masked;
+  }
   await Promise.all([
     saveTicket(t),
     redis.zadd(K.openZSet, { score: t.updatedAt, member: String(ticketId) }),
