@@ -66,7 +66,7 @@ import {
   type FaqNode,
 } from './faq';
 import { ensureTopic, noteInTopic, relayClientToTopic, reopenTopic, syncTopicName } from './forum';
-import { quickAnswerButton, quickAnswerCallbackRetry } from './quick-answer';
+import { keyboardOpensWebApp, quickAnswerButton, quickAnswerCallbackRetry } from './quick-answer';
 import {
   answerCallbackQuery,
   copyMessage,
@@ -347,6 +347,11 @@ async function showFaqMenu(
     });
   }
 
+  if (res.ok) {
+    if (keyboardOpensWebApp(keyboard)) await endInChatModeForMiniApp(userId);
+    return;
+  }
+
   const retry = quickAnswerCallbackRetry(keyboard, res);
   if (retry === null) return;
   console.error('[support] menu with the Mini App button rejected, resending with the callback:', res.description);
@@ -355,6 +360,27 @@ async function showFaqMenu(
     reply_markup: { inline_keyboard: retry },
   });
   if (!again.ok) console.error('[support] menu resend with the callback failed:', again.description);
+}
+
+/**
+ * End the in-chat assistant for someone whose menu now opens the Mini App.
+ *
+ * The menu is reached with the in-chat mode still on: /ai and every in-chat
+ * answer arm it, and «🏠 В меню» does not turn it off. From this menu the way
+ * into ProxysAI is the Mini App, and the Mini App cannot turn the mode off. If
+ * ProxysAI escalates there, the site sends the person back to this chat, and
+ * with the mode left on their next message would reach the assistant again
+ * instead of an operator. So the mode ends when such a menu is on screen.
+ *
+ * Its start is kept as the handoff mark first, the same way «Связаться со
+ * специалистом» does it: a ticket opened from here within half an hour still
+ * gets the conversation. Only for people inside the Mini App gate; everyone
+ * else's menu keeps the in-chat callback and their mode is untouched.
+ */
+async function endInChatModeForMiniApp(userId: number): Promise<void> {
+  if (!(await isAiMode(userId))) return;
+  await markAiHandoff(userId, await aiModeStartedAt(userId));
+  await disableAiMode(userId);
 }
 
 /**
@@ -689,7 +715,8 @@ function menuQuickAnswer(userId: number): InlineKeyboardButton | null {
  * turns it off. The Mini App cannot. If ProxysAI escalates there, the site
  * sends the person back to this chat, and with the mode still on their next
  * message would reach the assistant again instead of an operator, with no
- * ticket and no transcript. The Mini App opens only from the FAQ menu.
+ * ticket and no transcript. The Mini App opens only from the FAQ menu, and
+ * showing that menu turns the in-chat mode off (`endInChatModeForMiniApp`).
  */
 function aiReplyKeyboard() {
   return {
