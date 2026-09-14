@@ -22,7 +22,12 @@
 // of the thousands of emoji, and each miss swallowed a complaint.
 //
 // «Да», «нет», «ага» are left out on purpose: they answer an operator's question
-// («у вас iPhone?»), and after them the operator has to continue.
+// («у вас iPhone?»), and after them the operator has to continue. A bare
+// present-tense «работает» is the same kind of answer («Германия через Happ
+// работает?»), so it closes only next to another word: «всё работает».
+//
+// Russian bracket smileys count too: «)» is a smile, «((» and «:(» are a sad
+// face, and «понятно(((» means "disappointed, still broken".
 
 import type { TgMessage } from './types';
 
@@ -62,6 +67,18 @@ const CLOSING_FILLER: ReadonlySet<string> = new Set([
   'хорошего', 'дня', 'вечера',
   'you', 'so', 'very', 'much', 'a', 'lot', 'now', 'it', 'all',
 ]);
+
+/**
+ * "It works" in the present tense. Alone it may answer an operator's question
+ * about one location or app, not close the ticket; next to any other allowed
+ * word («всё работает», «работает, спасибо») it closes.
+ */
+const PRESENT_STATE: ReadonlySet<string> = new Set(['работает', 'работают', 'works', 'working']);
+
+/** How many times `ch` occurs in `text`. */
+function countChar(text: string, ch: string): number {
+  return text.split(ch).length - 1;
+}
 
 /**
  * Emoji modifiers and joiners: skin tones, VS15/VS16, ZWJ. Removed before the
@@ -125,6 +142,8 @@ export function isClosingRemark(text: string): boolean {
   const trimmed = text.trim();
   if (trimmed === '' || trimmed.length > MAX_CHARS) return false;
   if (QUESTION_MARK.test(trimmed)) return false;
+  // «понятно(((», «ок((», «:(»: a sad bracket smiley. A lone «)» is a smile.
+  if (trimmed.includes('((') || countChar(trimmed, '(') > countChar(trimmed, ')')) return false;
 
   const symbols = classifySymbols(trimmed);
   if (symbols === 'uncertain') return false;
@@ -139,6 +158,7 @@ export function isClosingRemark(text: string): boolean {
   if (words.length === 0) return symbols === 'positive';
 
   if (words.length > MAX_WORDS) return false;
+  if (words.length === 1 && PRESENT_STATE.has(words[0])) return false;
   let hasCore = false;
   for (const w of words) {
     if (CLOSING_CORE.has(w)) hasCore = true;

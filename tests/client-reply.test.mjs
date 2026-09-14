@@ -118,6 +118,24 @@ test("bare yes/no answers wait: the operator may have asked something", () => {
   }
 });
 
+test("a bare present-tense «работает» waits, next to another word it closes", () => {
+  for (const text of ["работает", "Работает!", "работают", "works", "working"]) {
+    assert.equal(isClosingRemark(text), false, text);
+  }
+  for (const text of ["всё работает", "работает, спасибо", "теперь работают", "it works"]) {
+    assert.equal(isClosingRemark(text), true, text);
+  }
+});
+
+test("sad bracket smileys wait, a smiling bracket closes", () => {
+  for (const text of ["понятно(((", "ок((", "ладно((", "спасибо :(", "спасибо (", "понятно ((:"]) {
+    assert.equal(isClosingRemark(text), false, text);
+  }
+  for (const text of ["спасибо :)", "понятно)))", "(спасибо)"]) {
+    assert.equal(isClosingRemark(text), true, text);
+  }
+});
+
 test("filler words alone do not close", () => {
   for (const text of ["вам", "теперь", "всё", "it", "now", "большое"]) {
     assert.equal(isClosingRemark(text), false, text);
