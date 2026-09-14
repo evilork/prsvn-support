@@ -66,7 +66,7 @@ import {
   type FaqNode,
 } from './faq';
 import { ensureTopic, noteInTopic, relayClientToTopic, reopenTopic, syncTopicName } from './forum';
-import { quickAnswerButton, type QuickAnswerAction } from './quick-answer';
+import { quickAnswerButton } from './quick-answer';
 import {
   answerCallbackQuery,
   copyMessage,
@@ -609,26 +609,17 @@ const CONTACT_BUTTON = { text: '🆘 Связаться со специалис�
 const MENU_BUTTON = { text: '🏠 В меню', callback_data: 'faq:menu' } as const;
 
 /**
- * A quick-answer button for a keyboard sent to this person's private chat.
- *
- * Every client keyboard in this file goes to `chat_id = user id`, which is the
- * private chat — the only place a web_app button is valid, so the chat id is
- * the user id by construction. The owner gets the ProxysAI Mini App, everyone
- * else the in-chat assistant with the same label and callback as before (see
- * lib/quick-answer.ts). The operator group never gets these keyboards.
- */
-function quickAnswerFor(userId: number, action: QuickAnswerAction): InlineKeyboardButton {
-  return quickAnswerButton(action, { userId, chatId: userId, siteUrl: config.siteUrl });
-}
-
-/**
  * «⚡ Быстрый ответ» for the FAQ menu, or null when this person does not see it.
  *
  * Visibility is still decided by `aiQuickAnswerEnabled` alone, as before; the
- * Mini App gate only changes what the visible button does.
+ * Mini App gate (lib/quick-answer.ts) only changes what the visible button
+ * does. The client menu always goes to `chat_id = user id`, the private chat —
+ * the only place a web_app button is valid — so the chat id is the user id by
+ * construction. The operator group never gets this keyboard.
  */
 function menuQuickAnswer(userId: number): InlineKeyboardButton | null {
-  return aiQuickAnswerEnabled(userId) ? quickAnswerFor(userId, 'open') : null;
+  if (!aiQuickAnswerEnabled(userId)) return null;
+  return quickAnswerButton({ userId, chatId: userId, siteUrl: config.siteUrl });
 }
 
 /**
@@ -641,14 +632,18 @@ function menuQuickAnswer(userId: number): InlineKeyboardButton | null {
  * оператора стоит постоянно. Под ОТКАЗОМ помощника кнопка остаётся — там она
  * единственный путь дальше, см. `aiFallbackKeyboard`.
  *
- * For the owner «⚡ Спросить ещё» opens the Mini App: the conversation is shared
- * with the dashboard, so it continues there. Typing in the chat still works —
- * the in-chat mode stays on after an answer.
+ * «⚡ Спросить ещё» stays the in-chat callback for everyone, the Mini App owner
+ * included: a conversation that started in the chat continues in the chat.
+ * Under an answer the in-chat mode (`support:aimode`) is on, and only the bot
+ * turns it off. The Mini App cannot. If ProxysAI escalates there, the site
+ * sends the person back to this chat, and with the mode still on their next
+ * message would reach the assistant again instead of an operator, with no
+ * ticket and no transcript. The Mini App opens only from the FAQ menu.
  */
-function aiReplyKeyboard(userId: number) {
+function aiReplyKeyboard() {
   return {
     inline_keyboard: [
-      [quickAnswerFor(userId, 'more')],
+      [{ text: '⚡ Спросить ещё', callback_data: 'ai:more' }],
       [MENU_BUTTON],
     ],
   };
@@ -736,7 +731,7 @@ async function runAttachmentAnswer(
     // Стикер и кость — реплика, а не вопрос. Ни тикета, ни гашения режима:
     // человек сказал «спасибо», и отвечать на это живым оператором значит
     // выключить помощника ровно перед следующим настоящим вопросом.
-    await sendMessage(user.id, attach.reply, { reply_markup: aiReplyKeyboard(user.id) });
+    await sendMessage(user.id, attach.reply, { reply_markup: aiReplyKeyboard() });
     await enableAiMode(user.id);
     return;
   }
@@ -970,7 +965,7 @@ async function runQuickAnswer(
     const last = i === chunks.length - 1;
     // Ответ модели уходит БЕЗ parse_mode: правила запрещают ей разметку, но
     // одна угловая скобка в режиме HTML стоила бы всего сообщения целиком.
-    await sendMessage(user.id, chunks[i], last ? { reply_markup: aiReplyKeyboard(user.id) } : {});
+    await sendMessage(user.id, chunks[i], last ? { reply_markup: aiReplyKeyboard() } : {});
   }
 
   // Режим продлеваем ПОСЛЕ отправки ответа. Наоборот было бы дороже: сбой базы
