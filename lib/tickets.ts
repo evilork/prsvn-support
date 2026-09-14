@@ -2,8 +2,12 @@
 import { Redis } from '@upstash/redis';
 import { disableAiMode } from './ai';
 import { config } from './config';
-import { maskSubscriptionLinks } from './redact';
+import { applyClientMessage, isWaiting } from './ticket-state';
 import type { TgUser } from './types';
+
+// isWaiting lives in lib/ticket-state.ts (pure, unit-tested); re-exported so
+// callers keep importing it from here.
+export { isWaiting };
 
 const redis = Redis.fromEnv();
 
@@ -45,6 +49,13 @@ export interface Ticket {
    * Вложения сюда не попадают — по ним отвечать вслепую нечего.
    */
   lastClientText?: string;
+  /**
+   * When the client last sent only a closing remark («спасибо», «ок», 👍) after
+   * an operator reply. Such a message does NOT move `lastClientAt`, so the
+   * ticket stays answered: no 🔴, no ping, no digest line (audit BS-1). The
+   * separate mark keeps that activity visible in the record.
+   */
+  lastClientAckAt?: number;
   /** Когда помощник ответил вместо молчания. Ставится один раз на тикет. */
   autoAnsweredAt?: number;
   /**
@@ -126,29 +137,20 @@ export async function touchTicket(
   ticketId: number,
   lastUserMsgId?: number,
   text?: string,
+  opts: { closing?: boolean } = {},
 ): Promise<Ticket | null> {
   const t = await getTicket(ticketId);
   if (!t) return null;
-  // Отметку начала ожидания ставим на переходе «отвечен → ждёт» И тогда, когда
-  // её ещё нет. Второе условие — не перестраховка: без него отметка не
-  // появлялась НИКОГДА у тикета, на который оператор ещё ни разу не отвечал.
-  // `isWaiting` у свежесозданного тикета уже true (`lastClientAt ?? updatedAt`
-  // больше нуля), поэтому «только на переходе» означало «только со второго
-  // круга», а до первого ответа оператора счётчик падал на запасной путь
-  // `lastClientAt` — то есть обнулялся каждым «ну что там?» ровно у самых
-  // настойчивых, у тех, ради кого всё и делалось.
-  if (!t.waitingSince || !isWaiting(t)) t.waitingSince = Date.now();
-  t.updatedAt = Date.now();
-  t.lastClientAt = t.updatedAt;
-  t.messagesCount += 1;
-  if (lastUserMsgId) t.lastUserMsgId = lastUserMsgId;
-  // Больше 600 знаков помощнику не нужно, а тикет лежит полгода.
-  // Mask subscription links BEFORE storing: this text goes to the operator's
-  // ping and to the model, and the link is the access itself (audit BS-7, see
-  // lib/redact.ts).
-  if (typeof text === 'string' && text.trim()) {
-    const masked = maskSubscriptionLinks(text.trim()).slice(0, 600);
-    if (masked) t.lastClientText = masked;
+  // Waiting marks, the stored question and link masking are decided in
+  // lib/ticket-state.ts, where they are unit-tested.
+  const effect = applyClientMessage(t, {
+    now: Date.now(),
+    messageId: lastUserMsgId,
+    text,
+    closing: opts.closing === true,
+  });
+  if (effect === 'acknowledged') {
+    console.log(`[support] #${t.id}: closing remark after the operator reply, ticket stays answered`);
   }
   await Promise.all([
     saveTicket(t),
@@ -204,13 +206,6 @@ export async function listStaleOpenIds(days: number, now = Date.now(), limit = 5
     count: limit,
   });
   return (ids || []).map((x) => parseInt(String(x), 10)).filter((n) => Number.isFinite(n));
-}
-
-/** Ждёт ли тикет ответа оператора. Старые тикеты без отметок считаем ждущими. */
-export function isWaiting(t: Ticket): boolean {
-  if (t.status !== 'open') return false;
-  const client = t.lastClientAt ?? t.updatedAt;
-  return client > (t.lastOperatorAt ?? 0);
 }
 
 export async function closeTicket(ticketId: number) {
