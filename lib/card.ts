@@ -40,7 +40,10 @@ export async function buildTicketCard(
     isBanned(t.userId),
   ]);
   const now = Date.now();
-  const lastClient = t.lastClientAt ? ` · клиент писал ${fmtAgo(t.lastClientAt, now)}` : '';
+  // A closing remark («спасибо») does not move `lastClientAt`, but the client did
+  // write: show whichever came last.
+  const lastClientMark = Math.max(t.lastClientAt ?? 0, t.lastClientAckAt ?? 0);
+  const lastClient = lastClientMark ? ` · клиент писал ${fmtAgo(lastClientMark, now)}` : '';
 
   const text = [
     `🎫 <b>Тикет #${t.id}</b> · ${ticketState(t)}${banned ? ' · ⛔ заблокирован' : ''}`,

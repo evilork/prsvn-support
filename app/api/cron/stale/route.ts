@@ -35,8 +35,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { Redis } from '@upstash/redis';
 import { askProxysAi, splitForTelegram } from '@/lib/ai';
+import { isClosingRemark } from '@/lib/client-reply';
 import { config, staleAutoAnswerEnabled } from '@/lib/config';
 import { noteInTopic } from '@/lib/forum';
+import { maskSubscriptionLinks } from '@/lib/redact';
 import { sendMessage } from '@/lib/telegram';
 import {
   claimAutoAnswer,
@@ -145,6 +147,8 @@ interface Stats {
   undelivered: number;
   /** Пропущены: последняя реплика — вложение, спрашивать нечего. */
   noQuestion: number;
+  /** Skipped: the only stored text is a thank-you, the model has nothing to answer. */
+  thanksOnly: number;
   /** Личных пингов оператору по отдельным тикетам за проход. */
   pings: number;
   digestTickets: number;
@@ -175,9 +179,18 @@ interface Stats {
  *     оператору: клиенту сказать нечего, а оператору — есть, и он узнаёт.
  */
 async function answerOne(t: Ticket, stats: Stats): Promise<void> {
-  const question = (t.lastClientText || '').trim();
+  // Masked here too, not only on write: tickets stored before 14.09.2026 live
+  // for 180 days and may still hold a full subscription link (audit BS-7).
+  const question = maskSubscriptionLinks((t.lastClientText || '').trim());
   if (!question) {
     stats.noQuestion += 1;
+    return;
+  }
+  // A ticket whose only text is «спасибо» (sent after /close, it opened a new
+  // ticket): a robot «пожалуйста» hours later answers nothing. The operator still
+  // gets the ping and the digest line with the text and closes it by hand.
+  if (isClosingRemark(question)) {
+    stats.thanksOnly += 1;
     return;
   }
   if (!(await claimAutoAnswer(t.id))) return;
@@ -349,6 +362,7 @@ export async function GET(req: NextRequest) {
     escalated: 0,
     undelivered: 0,
     noQuestion: 0,
+    thanksOnly: 0,
     pings: 0,
     digestTickets: 0,
     digestSent: false,
@@ -380,7 +394,9 @@ export async function GET(req: NextRequest) {
         x.ticket,
         `⏳ <b>Ждёт ответа ${hoursWord(x.waitedMs)}</b> — #${x.ticket.id} · ${escapeHtml(who(x.ticket))}` +
           (x.ticket.autoAnsweredAt ? '\nПомощник уже отвечал сам.' : '') +
-          (x.ticket.lastClientText ? `\n<i>${escapeHtml(x.ticket.lastClientText.slice(0, 200))}</i>` : ''),
+          (x.ticket.lastClientText
+            ? `\n<i>${escapeHtml(maskSubscriptionLinks(x.ticket.lastClientText).slice(0, 200))}</i>`
+            : ''),
         stats,
       );
     }

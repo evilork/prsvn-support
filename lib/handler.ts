@@ -56,6 +56,7 @@ import {
   UNKNOWN_ATTACHMENT,
   type Attachment,
 } from './attachments';
+import { isClosingMessage } from './client-reply';
 import { aiQuickAnswerEnabled, config, isAdmin } from './config';
 import {
   buildFaqKeyboard,
@@ -304,7 +305,15 @@ async function showClientMenu(userId: number) {
   });
 }
 
-async function forwardClientToAdmins(user: TgUser, msg: TgMessage): Promise<Ticket> {
+/**
+ * `opts.awaitOperator` — the message arrives through an explicit hand-off (the
+ * assistant escalated or failed), so the ticket waits whatever the text says.
+ */
+async function forwardClientToAdmins(
+  user: TgUser,
+  msg: TgMessage,
+  opts: { awaitOperator?: boolean } = {},
+): Promise<Ticket> {
   let ticket = await getActiveTicketForUser(user.id);
   let isNew = false;
   if (!ticket) {
@@ -316,7 +325,11 @@ async function forwardClientToAdmins(user: TgUser, msg: TgMessage): Promise<Tick
   // Текст едет в тикет: без него крону тихих тикетов нечего спросить у
   // помощника — в записи до сих пор лежал только номер сообщения. Подпись к
   // вложению (`caption`) годится ровно так же, как обычный текст.
-  const touched = await touchTicket(ticket.id, msg.message_id, msg.text || msg.caption);
+  // A short thank-you after the operator's reply is relayed like any other
+  // message but does not put the ticket back into "waiting": no 🔴, no ping, no
+  // digest line (audit BS-1, lib/client-reply.ts). A hand-off always waits.
+  const closing = opts.awaitOperator !== true && isClosingMessage(msg);
+  const touched = await touchTicket(ticket.id, msg.message_id, msg.text || msg.caption, { closing });
   await addTicketMsg(ticket.id, msg.message_id);
   const fresh = touched ?? ticket;
 
@@ -424,8 +437,9 @@ async function relayViaForum(
   if (!t.threadId) {
     t = await ensureTopic(ticket, { migrate: !isNew });
     if (!t || !t.threadId) return false;
-  } else if (!wasWaiting) {
+  } else if (!wasWaiting && isWaiting(t)) {
     // Был отвечен — снова ждёт: имя темы должно это показать.
+    // A closing remark leaves it answered: the 🟢 name stays, no rename call.
     await syncTopicName(t);
   }
   return relayClientToTopic(t, msg);
@@ -829,7 +843,7 @@ async function handOffToOperator(
   await disableAiMode(user.id);
   await sendMessage(user.id, album ? `${opts.toHuman}\n\n${AI_ALBUM_TO_OPERATOR}` : opts.toHuman);
 
-  const ticket = await forwardClientToAdmins(user, msg);
+  const ticket = await forwardClientToAdmins(user, msg, { awaitOperator: true });
   if (album) await relayAlbumRest(user, album, msg.message_id);
 
   await attachAiTranscript(ticket, user.id, {
