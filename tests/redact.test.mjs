@@ -28,6 +28,27 @@ test("masks a token path sent without a host", () => {
   assert.equal(maskSubscriptionLinks(`/api/sub/${TOKEN}/vless`), "/api/sub/<ключ скрыт>/vless");
 });
 
+test("masks token paths regardless of case", () => {
+  assert.equal(
+    maskSubscriptionLinks(`https://proxysvpn.com/API/SUB/${TOKEN}`),
+    "https://proxysvpn.com/API/SUB/<ключ скрыт>",
+  );
+  assert.equal(maskSubscriptionLinks(`proxysvpn.com/P/${TOKEN}`), "proxysvpn.com/P/<ключ скрыт>");
+});
+
+test("masks a bare 32-hex subscription token, keeps dashed payment ids", () => {
+  const hex = "0f9872eb5d5c0ea318d07bb6f856d31f";
+  assert.equal(maskSubscriptionLinks(`мой ключ ${hex}`), "мой ключ <ключ скрыт>");
+  assert.equal(maskSubscriptionLinks(hex.toUpperCase()), "<ключ скрыт>");
+  assert.equal(maskSubscriptionLinks(`https://proxysvpn.com/api/sub/${hex}`), "https://proxysvpn.com/api/sub/<ключ скрыт>");
+
+  const payment = "платёж 22e12f66-000f-5000-8000-18db351245c7";
+  assert.equal(maskSubscriptionLinks(payment), payment);
+  // 31 or 33 hex characters are not a token.
+  assert.equal(maskSubscriptionLinks(hex.slice(1)), hex.slice(1));
+  assert.equal(maskSubscriptionLinks(`${hex}a`), `${hex}a`);
+});
+
 test("masks happ://crypt4 and happ://add deep links whole", () => {
   const crypt = maskSubscriptionLinks("открываю happ://crypt4/QUJDREVGR0hJSktMTU5PUA== и ошибка");
   assert.equal(crypt, "открываю happ://<ссылка скрыта> и ошибка");

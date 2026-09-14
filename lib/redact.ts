@@ -13,7 +13,8 @@
 // real link to check it. The mask applies only to the copy that travels further.
 //
 // The link's shape stays visible, so the text still says what it was about. The
-// rule matches the site's export redaction (`redact` in src/lib/support-export.ts).
+// rules follow the site's export redaction (`redact` in src/lib/support-export.ts),
+// except its dashed-UUID rule: see `maskSubscriptionLinks`.
 
 const KEY_MASK = '<ключ скрыт>';
 const LINK_MASK = '<ссылка скрыта>';
@@ -41,16 +42,26 @@ const HAPP_LINK_RE = /\bhapp:\/\/(?!routing\/|<)\S+/gi;
  * Site paths whose last segment is the subscription token: the subscription
  * itself (/api/sub), the Happ import page (/p), the add page (/add) and the QR
  * image (/api/qr). Token shape as the site checks it (TOKEN_RE in
- * src/lib/sub-token-lookup.ts): eight characters or more.
+ * src/lib/sub-token-lookup.ts): eight characters or more. Case-insensitive:
+ * a phone keyboard or a retyped link turns /api/sub into /API/SUB.
  */
-const TOKEN_PATH_RE = /(\/(?:api\/sub|api\/qr|p|add)\/)[A-Za-z0-9_-]{8,}/g;
+const TOKEN_PATH_RE = /(\/(?:api\/sub|api\/qr|p|add)\/)[A-Za-z0-9_-]{8,}/gi;
 
 /**
- * The text with subscription links masked. Everything else is unchanged.
+ * A subscription token pasted without the link: 32 hex characters in a row, as
+ * the site issues them (`randomBytes(16).toString('hex')` in src/lib/accounts.ts).
+ * Same rule as the site export. A dashed UUID never has 32 hex characters in a
+ * row, so YooKassa payment ids are not touched.
+ */
+const BARE_HEX_TOKEN_RE = /\b[0-9a-f]{32}\b/gi;
+
+/**
+ * The text with subscription links and bare tokens masked. Everything else is
+ * unchanged.
  *
- * Bare UUIDs and hex strings are NOT masked, unlike the site export: people
- * also send YooKassa payment ids in that shape («оплатил, платёж 22e12f66-…»),
- * and the operator ping and the model question lose their point without them.
+ * Dashed UUIDs are NOT masked, unlike the site export: people send YooKassa
+ * payment ids in that shape («оплатил, платёж 22e12f66-…»), and the operator
+ * ping and the model question lose their point without them.
  *
  * Order matters: a Happ deep link contains a plain subscription URL, so it must
  * be removed whole before the path mask leaves a fragment like
@@ -61,5 +72,6 @@ export function maskSubscriptionLinks(text: string): string {
   return text
     .replace(PROXY_URI_RE, LINK_MASK)
     .replace(HAPP_LINK_RE, `happ://${LINK_MASK}`)
-    .replace(TOKEN_PATH_RE, `$1${KEY_MASK}`);
+    .replace(TOKEN_PATH_RE, `$1${KEY_MASK}`)
+    .replace(BARE_HEX_TOKEN_RE, KEY_MASK);
 }
