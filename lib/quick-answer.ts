@@ -17,7 +17,7 @@
 // import without the bot's secrets, and this gate is what has to be tested.
 
 import { OWNER_USER_ID } from './owner';
-import type { InlineKeyboardButton } from './types';
+import type { InlineKeyboard, InlineKeyboardButton } from './types';
 
 /**
  * Who gets the Mini App instead of the in-chat assistant.
@@ -106,4 +106,51 @@ export function quickAnswerButton(target: QuickAnswerTarget): InlineKeyboardButt
     if (url !== null) return { text: QUICK_ANSWER_LABEL, web_app: { url } };
   }
   return { text: QUICK_ANSWER_LABEL, callback_data: QUICK_ANSWER_CALLBACK };
+}
+
+/** Whether any button of this keyboard opens a Mini App. */
+export function keyboardOpensWebApp(keyboard: InlineKeyboard): boolean {
+  return keyboard.some((row) => row.some((button) => button.web_app !== undefined));
+}
+
+/** The part of a Telegram API response the retry decision reads. */
+export interface SendOutcome {
+  readonly ok: boolean;
+  readonly error_code?: number;
+}
+
+/**
+ * The keyboard to resend after Telegram refused one with a web_app button, or
+ * null when there is nothing to retry.
+ *
+ * Retried only on a 400 — Telegram rejecting the message itself, which is what
+ * an unacceptable web_app button produces. Not on success, not on a keyboard
+ * without web_app (the failure has another cause and the same keyboard would
+ * fail again), not on 403/429 and not on a network failure (no error_code):
+ * there the first message may have arrived, and a duplicate menu is worse.
+ *
+ * In the copy the Mini App button becomes the in-chat callback with the same
+ * label; any other web_app button is dropped, together with a row it leaves
+ * empty. Everything else is kept in place.
+ */
+export function quickAnswerCallbackRetry(
+  keyboard: InlineKeyboard,
+  outcome: SendOutcome,
+): InlineKeyboard | null {
+  if (outcome.ok || outcome.error_code !== 400) return null;
+  if (!keyboardOpensWebApp(keyboard)) return null;
+
+  const rows: InlineKeyboard = [];
+  for (const row of keyboard) {
+    const kept: InlineKeyboardButton[] = [];
+    for (const button of row) {
+      if (button.web_app === undefined) {
+        kept.push({ ...button });
+      } else if (button.text === QUICK_ANSWER_LABEL) {
+        kept.push({ text: QUICK_ANSWER_LABEL, callback_data: QUICK_ANSWER_CALLBACK });
+      }
+    }
+    if (kept.length > 0) rows.push(kept);
+  }
+  return rows;
 }

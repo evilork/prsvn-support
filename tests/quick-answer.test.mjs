@@ -15,6 +15,7 @@ const {
   QUICK_ANSWER_WEBAPP_PATH,
   QUICK_ANSWER_WEBAPP_USER_IDS,
   quickAnswerButton,
+  quickAnswerCallbackRetry,
   quickAnswerOpensWebApp,
   quickAnswerWebAppUrl,
 } = quickAnswer;
@@ -119,4 +120,48 @@ test("a button carries exactly one action", () => {
     const actions = ["callback_data", "web_app", "url"].filter((key) => key in button);
     assert.equal(actions.length, 1, `${target.userId} (${target.siteUrl})`);
   }
+});
+
+// The owner's menu as lib/faq.ts builds it: sections, the quick answer, contact.
+const WEB_APP_OPEN = { text: "⚡ Быстрый ответ", web_app: { url: MINI_APP } };
+const SECTION = { text: "🔌 Не подключается", callback_data: "faq:connect" };
+const CONTACT = { text: "🆘 Связаться со специалистом", callback_data: "contact" };
+const ownerMenu = () => [[SECTION], [WEB_APP_OPEN], [CONTACT]];
+const REJECTED = { ok: false, error_code: 400, description: "Bad Request: BUTTON_TYPE_INVALID" };
+
+test("keyboardOpensWebApp sees a web_app button anywhere and nothing else", () => {
+  assert.equal(quickAnswer.keyboardOpensWebApp(ownerMenu()), true);
+  assert.equal(quickAnswer.keyboardOpensWebApp([[SECTION], [CALLBACK_OPEN], [CONTACT]]), false);
+  assert.equal(quickAnswer.keyboardOpensWebApp([]), false);
+  assert.equal(quickAnswer.keyboardOpensWebApp([[]]), false);
+});
+
+test("a 400 on the Mini App menu is resent with the in-chat callback in place", () => {
+  const menu = ownerMenu();
+  const snapshot = structuredClone(menu);
+  assert.deepEqual(quickAnswerCallbackRetry(menu, REJECTED), [[SECTION], [CALLBACK_OPEN], [CONTACT]]);
+  assert.deepEqual(menu, snapshot, "the original keyboard is not mutated");
+});
+
+test("no retry unless Telegram itself rejected a keyboard with web_app", () => {
+  const menu = ownerMenu();
+  const callbackMenu = [[SECTION], [CALLBACK_OPEN], [CONTACT]];
+  // Delivered: nothing to do.
+  assert.equal(quickAnswerCallbackRetry(menu, { ok: true }), null);
+  // No web_app: the failure has another cause, the same keyboard fails again.
+  assert.equal(quickAnswerCallbackRetry(callbackMenu, REJECTED), null);
+  // Network failure (call() returns no error_code): the first send may have arrived.
+  assert.equal(quickAnswerCallbackRetry(menu, { ok: false, description: "TimeoutError" }), null);
+  // Blocked by the user, flood control, server errors: a resend cannot help.
+  for (const error_code of [401, 403, 404, 409, 429, 500, 502]) {
+    assert.equal(quickAnswerCallbackRetry(menu, { ok: false, error_code }), null, String(error_code));
+  }
+});
+
+test("the retry drops a foreign web_app button and the row it empties", () => {
+  const foreign = { text: "Other app", web_app: { url: "https://example.com/app" } };
+  const keyboard = [[SECTION, foreign], [foreign], [WEB_APP_OPEN], [CONTACT]];
+  const retry = quickAnswerCallbackRetry(keyboard, REJECTED);
+  assert.deepEqual(retry, [[SECTION], [CALLBACK_OPEN], [CONTACT]]);
+  assert.equal(quickAnswer.keyboardOpensWebApp(retry), false);
 });

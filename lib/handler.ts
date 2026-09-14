@@ -66,7 +66,7 @@ import {
   type FaqNode,
 } from './faq';
 import { ensureTopic, noteInTopic, relayClientToTopic, reopenTopic, syncTopicName } from './forum';
-import { quickAnswerButton } from './quick-answer';
+import { quickAnswerButton, quickAnswerCallbackRetry } from './quick-answer';
 import {
   answerCallbackQuery,
   copyMessage,
@@ -98,7 +98,14 @@ import {
   touchTicket,
   type Ticket,
 } from './tickets';
-import type { InlineKeyboardButton, TgCallbackQuery, TgMessage, TgUser, Update } from './types';
+import type {
+  InlineKeyboardButton,
+  TgCallbackQuery,
+  TgMessage,
+  TgResponse,
+  TgUser,
+  Update,
+} from './types';
 
 const RATE_LIMIT_MSG = 'Слишком много сообщений. Подождите минуту.';
 const BANNED_MSG = 'Вы заблокированы в поддержке.';
@@ -299,11 +306,55 @@ async function shouldAnswerWithAi(userId: number): Promise<boolean> {
 }
 
 async function showClientMenu(userId: number) {
-  const root = findNode('menu')!;
-  await sendMessage(userId, CLIENT_WELCOME, {
+  await showFaqMenu(userId, findNode('menu')!, CLIENT_WELCOME, null);
+}
+
+/**
+ * Put a client FAQ menu on screen: edit `messageId` in place, or send it anew
+ * when there is nothing to edit or the edit failed.
+ *
+ * The menu always lives in the person's private chat, so `userId` is also the
+ * chat id. For everyone outside the Mini App gate the Telegram calls are the
+ * ones the bot made before: one send, or an edit with a send as its fallback.
+ *
+ * The Mini App button adds one failure the local URL check cannot rule out:
+ * Telegram refusing the web_app button itself (BUTTON_TYPE_INVALID, a URL it
+ * does not take). That rejects the whole message, and the person would be left
+ * with no menu at all. So a 400 on a keyboard with a web_app button is logged
+ * and the menu is sent once more with the in-chat callback in its place. A
+ * network failure is not retried: the first send may have arrived, and a
+ * second menu would be worse than none being confirmed.
+ */
+async function showFaqMenu(
+  userId: number,
+  node: FaqNode,
+  text: string,
+  messageId: number | null,
+): Promise<void> {
+  const keyboard = buildFaqKeyboard(node, { ai: menuQuickAnswer(userId) });
+
+  let res: TgResponse<unknown> | null = null;
+  if (messageId !== null) {
+    res = await editMessageText(userId, messageId, text, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: keyboard },
+    });
+  }
+  if (res === null || !res.ok) {
+    res = await sendMessage(userId, text, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: keyboard },
+    });
+  }
+
+  const retry = quickAnswerCallbackRetry(keyboard, res);
+  if (retry === null) return;
+  console.error('[support] menu with the Mini App button rejected, resending with the callback:', res.description);
+  const again = await sendMessage(userId, text, {
     parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: buildFaqKeyboard(root, { ai: menuQuickAnswer(userId) }) },
+    reply_markup: { inline_keyboard: retry },
   });
+  if (!again.ok) console.error('[support] menu resend with the callback failed:', again.description);
 }
 
 /**
@@ -1420,18 +1471,7 @@ async function renderFaqNode(chatId: number, messageId: number, node: FaqNode) {
 
   // Клиентское меню всегда живёт в личке, так что chatId здесь — это и есть
   // идентификатор человека, которому решается показать «Быстрый ответ».
-  const keyboard = { inline_keyboard: buildFaqKeyboard(node, { ai: menuQuickAnswer(chatId) }) };
-
-  const res = await editMessageText(chatId, messageId, text, {
-    parse_mode: 'HTML',
-    reply_markup: keyboard,
-  });
-  if (!res.ok) {
-    await sendMessage(chatId, text, {
-      parse_mode: 'HTML',
-      reply_markup: keyboard,
-    });
-  }
+  await showFaqMenu(chatId, node, text, messageId);
 }
 
 async function handleAdminCallback(cb: TgCallbackQuery, data: string) {
