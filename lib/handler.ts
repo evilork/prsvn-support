@@ -66,7 +66,13 @@ import {
   type FaqNode,
 } from './faq';
 import { ensureTopic, noteInTopic, relayClientToTopic, reopenTopic, syncTopicName } from './forum';
-import { keyboardOpensWebApp, quickAnswerButton, quickAnswerCallbackRetry } from './quick-answer';
+import {
+  keyboardOpensWebApp,
+  quickAnswerButton,
+  quickAnswerCallbackRetry,
+  quickAnswerWebAppAccess,
+} from './quick-answer';
+import { quickAnswerAccountCheck, quickAnswerGate } from './quick-answer-gate';
 import {
   answerCallbackQuery,
   copyMessage,
@@ -331,7 +337,7 @@ async function showFaqMenu(
   text: string,
   messageId: number | null,
 ): Promise<void> {
-  const keyboard = buildFaqKeyboard(node, { ai: menuQuickAnswer(userId) });
+  const keyboard = buildFaqKeyboard(node, { ai: await menuQuickAnswer(userId) });
 
   let res: TgResponse<unknown> | null = null;
   if (messageId !== null) {
@@ -689,14 +695,33 @@ const MENU_BUTTON = { text: '🏠 В меню', callback_data: 'faq:menu' } as c
  * «⚡ Быстрый ответ» for the FAQ menu, or null when this person does not see it.
  *
  * Visibility is still decided by `aiQuickAnswerEnabled` alone, as before; the
- * Mini App gate (lib/quick-answer.ts) only changes what the visible button
- * does. The client menu always goes to `chat_id = user id`, the private chat —
- * the only place a web_app button is valid — so the chat id is the user id by
- * construction. The operator group never gets this keyboard.
+ * Mini App gate only changes what the visible button does. The gate is the
+ * site's Redis set `support:miniapp:users`, the same switch as the dashboard
+ * button: lib/quick-answer-gate.ts reads it at most once a minute per instance
+ * and fails closed to the callback, lib/quick-answer.ts decides. The client
+ * menu always goes to `chat_id = user id`, the private chat — the only place a
+ * web_app button is valid — so the chat id is the user id by construction. The
+ * operator group never gets this keyboard.
+ *
+ * `*` opens the Mini App only to someone whose Telegram reaches an account on
+ * the site (see `quickAnswerWebAppAccess` for why). That lookup is made only
+ * when `*` alone decides: the owner, a `tg_<id>` member and everyone outside
+ * the set cost nothing beyond the cached set, and the lookup itself is cached
+ * per person for the same minute and fails closed to the callback.
  */
-function menuQuickAnswer(userId: number): InlineKeyboardButton | null {
+async function menuQuickAnswer(userId: number): Promise<InlineKeyboardButton | null> {
   if (!aiQuickAnswerEnabled(userId)) return null;
-  return quickAnswerButton({ userId, chatId: userId, siteUrl: config.siteUrl });
+  const gate = await quickAnswerGate.load();
+  const hasSiteAccount =
+    quickAnswerWebAppAccess(userId, userId, gate.members) === 'account' &&
+    (await quickAnswerAccountCheck.has(userId));
+  return quickAnswerButton({
+    userId,
+    chatId: userId,
+    siteUrl: config.siteUrl,
+    webAppMembers: gate.members,
+    hasSiteAccount,
+  });
 }
 
 /**
@@ -709,8 +734,9 @@ function menuQuickAnswer(userId: number): InlineKeyboardButton | null {
  * оператора стоит постоянно. Под ОТКАЗОМ помощника кнопка остаётся — там она
  * единственный путь дальше, см. `aiFallbackKeyboard`.
  *
- * «⚡ Спросить ещё» stays the in-chat callback for everyone, the Mini App owner
- * included: a conversation that started in the chat continues in the chat.
+ * «⚡ Спросить ещё» stays the in-chat callback for everyone, people the Mini App
+ * is open to included: a conversation that started in the chat continues in
+ * the chat.
  * Under an answer the in-chat mode (`support:aimode`) is on, and only the bot
  * turns it off. The Mini App cannot. If ProxysAI escalates there, the site
  * sends the person back to this chat, and with the mode still on their next

@@ -3,7 +3,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { config } from '@/lib/config';
 import { askProxysAi } from '@/lib/ai';
 import { handleUpdate } from '@/lib/handler';
-import { QUICK_ANSWER_WEBAPP_USER_IDS, quickAnswerWebAppUrl } from '@/lib/quick-answer';
+import { OWNER_USER_ID } from '@/lib/owner';
+import { quickAnswerWebAppUrl } from '@/lib/quick-answer';
+import { describeQuickAnswerGate, quickAnswerGate } from '@/lib/quick-answer-gate';
 import type { Update } from '@/lib/types';
 
 export const runtime = 'nodejs';
@@ -70,6 +72,9 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ ok: true, probe: result, tookMs: Date.now() - started });
   }
 
+  // The same cached snapshot the menu uses on this instance; load() never rejects.
+  const gateSnapshot = await quickAnswerGate.load();
+
   return NextResponse.json({
     ok: true,
     service: 'proxysvpn-support-bot',
@@ -81,11 +86,23 @@ export async function GET(req: NextRequest) {
       forumMode: config.forumMode,
       siteUrl: config.siteUrl,
       // Who gets «⚡ Быстрый ответ» as the Mini App, and the URL it opens.
-      // `url: null` means SITE_URL is unusable for web_app and even the owner
-      // gets the in-chat assistant — the same "button quietly differs" blind
-      // spot this endpoint exists for.
+      //
+      // `gate` describes the site's Redis set in counts only, never member ids.
+      // `source: "unavailable"` means the read failed and everyone but the
+      // owner gets the in-chat assistant; `ignoredMembers` above zero is
+      // usually an id added without `tg_`. It is this instance's cache, up to
+      // `ttlMs` old, so an SADD shows here within a minute.
+      //
+      // `everyone: true` opens the Mini App to people whose Telegram reaches an
+      // account on the site, as the dashboard button does; a Telegram the site
+      // has never seen still gets the in-chat assistant (lib/quick-answer.ts).
+      //
+      // `url: null` means SITE_URL is unusable for web_app and everyone, the
+      // owner included, gets the in-chat assistant — the same "button quietly
+      // differs" blind spot this endpoint exists for.
       quickAnswerWebApp: {
-        userIds: QUICK_ANSWER_WEBAPP_USER_IDS,
+        ownerUserId: OWNER_USER_ID,
+        gate: describeQuickAnswerGate(gateSnapshot, Date.now(), quickAnswerGate.ttlMs),
         url: quickAnswerWebAppUrl(config.siteUrl),
       },
     },
