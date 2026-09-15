@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { config } from '@/lib/config';
 import { askProxysAi } from '@/lib/ai';
 import { handleUpdate } from '@/lib/handler';
-import { QUICK_ANSWER_WEBAPP_USER_IDS, quickAnswerWebAppUrl } from '@/lib/quick-answer';
+import { quickAnswerWebAppUrl } from '@/lib/quick-answer';
 import type { Update } from '@/lib/types';
 
 export const runtime = 'nodejs';
@@ -80,12 +80,11 @@ export async function GET(req: NextRequest) {
       adminUserIds: config.adminUserIds,
       forumMode: config.forumMode,
       siteUrl: config.siteUrl,
-      // Who gets «⚡ Быстрый ответ» as the Mini App, and the URL it opens.
-      // `url: null` means SITE_URL is unusable for web_app and even the owner
+      // The URL «⚡ Быстрый ответ» opens as the Mini App. `url: null` means
+      // SITE_URL is unusable for web_app and everyone, the owner included,
       // gets the in-chat assistant — the same "button quietly differs" blind
       // spot this endpoint exists for.
       quickAnswerWebApp: {
-        userIds: QUICK_ANSWER_WEBAPP_USER_IDS,
         url: quickAnswerWebAppUrl(config.siteUrl),
       },
     },

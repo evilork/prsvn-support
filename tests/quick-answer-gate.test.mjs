@@ -235,6 +235,22 @@ test("invalid options are refused when the gate is built", () => {
   }
 });
 
+test("a failed read closes the Mini App to all but the owner, never the menu", async () => {
+  const { quickAnswerButton } = await import("../lib/quick-answer.ts");
+  const SITE = "https://proxysvpn.com";
+  const WEB_APP_OPEN = { text: "⚡ Быстрый ответ", web_app: { url: `${SITE}/tg/support` } };
+  const CALLBACK_OPEN = { text: "⚡ Быстрый ответ", callback_data: "ai" };
+  const { gate, clock, log } = gateWith([["*"], new Error("down")]);
+  const menuButton = async (userId) =>
+    quickAnswerButton({ userId, chatId: userId, siteUrl: SITE, webAppMembers: (await gate.load()).members });
+
+  assert.deepEqual(await menuButton(42), WEB_APP_OPEN);
+  clock.advance(TTL);
+  assert.deepEqual(await menuButton(42), CALLBACK_OPEN);
+  assert.deepEqual(await menuButton(6944217115), WEB_APP_OPEN);
+  assert.equal(log.lines.length, 1);
+});
+
 test("the bot's own gate fails closed on a Redis it cannot use", async (t) => {
   // The stubbed Upstash client throws on any use, as a broken one would.
   const errors = t.mock.method(console, "error", () => {});

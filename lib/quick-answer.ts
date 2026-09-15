@@ -2,10 +2,12 @@
 //
 // The "⚡ Быстрый ответ" button in the FAQ menu: in-chat assistant or Mini App.
 //
-// Everyone gets the in-chat assistant, exactly as before: callback `ai`,
-// handled in lib/handler.ts. People on the allowlist below get the same
-// ProxysAI as a Telegram Mini App instead — `${SITE_URL}/tg/support`, the
-// dashboard's chat running inside Telegram.
+// Outside the gate the button is the in-chat assistant, exactly as before:
+// callback `ai`, handled in lib/handler.ts. Inside it the same ProxysAI opens
+// as a Telegram Mini App instead — `${SITE_URL}/tg/support`, the dashboard's
+// chat running inside Telegram. The gate is the site's own switch, the Redis
+// set `support:miniapp:users`, so one SADD or SREM opens or closes the Mini
+// App on both surfaces at once.
 //
 // Only the menu button. "⚡ Спросить ещё" under an in-chat answer stays the
 // `ai:more` callback for everyone: that conversation has the in-chat mode on,
@@ -13,25 +15,13 @@
 // person back to a chat where the assistant still intercepts their messages
 // (see `aiReplyKeyboard` in lib/handler.ts).
 //
-// Pure on purpose: no config, no Redis, no network. lib/config.ts throws on
-// import without the bot's secrets, and this gate is what has to be tested.
+// Pure on purpose: no config, no Redis, no network. The set's members come in
+// as an argument (lib/quick-answer-gate.ts reads them, cached and failing
+// closed); lib/config.ts throws on import without the bot's secrets, and this
+// gate is what has to be tested.
 
 import { OWNER_USER_ID } from './owner';
 import type { InlineKeyboard, InlineKeyboardButton } from './types';
-
-/**
- * Who gets the Mini App instead of the in-chat assistant.
- *
- * Only the owner, per the project rule: a new screen is shown to him first and
- * opened to everyone only after his explicit go-ahead. A constant rather than
- * an env var or a Redis list, for two reasons. A gate that silently opens when
- * a variable is lost is not a gate. And the Mini App depends on a separate
- * frontend deploy — the site must serve /tg/support and accept initData signed
- * by THIS bot's token — which has to be verified in Telegram before anyone
- * else sees the button, so widening the list is meant to be a reviewed code
- * change.
- */
-export const QUICK_ANSWER_WEBAPP_USER_IDS: readonly number[] = Object.freeze([OWNER_USER_ID]);
 
 /** The Mini App route on the site. */
 export const QUICK_ANSWER_WEBAPP_PATH = '/tg/support';
@@ -144,15 +134,34 @@ export function quickAnswerWebAppUrl(siteUrl: string): string | null {
 /**
  * Whether this person, in this chat, is given the Mini App.
  *
+ * `members` is what `support:miniapp:users` holds — the site's set, the one
+ * its dashboard button reads — or an empty list when it could not be read:
+ *
+ * - the owner always, whatever the set holds and whether it was read at all:
+ *   the gate must not lock out the person checking it, and a new screen is
+ *   his to look at first;
+ * - `*` in the set opens it to everyone;
+ * - `tg_<id>` opens it to that person;
+ * - anyone else keeps the in-chat callback.
+ *
  * A web_app inline button is valid only in a private chat with the bot; in a
  * group or a forum topic Telegram rejects the whole message. A private chat's
  * id equals the user's id, so the operator group, its topics and anyone else's
- * chat never match.
+ * chat never match — not for the owner, not with `*` in the set.
+ *
+ * O(n) in the size of the set.
  */
-export function quickAnswerOpensWebApp(userId: number, chatId: number): boolean {
-  if (!Number.isSafeInteger(userId) || userId <= 0) return false;
+export function quickAnswerOpensWebApp(
+  userId: number,
+  chatId: number,
+  members: readonly unknown[],
+): boolean {
+  const own = quickAnswerWebAppMember(userId);
+  if (own === null) return false;
   if (chatId !== userId) return false;
-  return QUICK_ANSWER_WEBAPP_USER_IDS.includes(userId);
+  if (userId === OWNER_USER_ID) return true;
+  if (!Array.isArray(members)) return false;
+  return members.includes(QUICK_ANSWER_WEBAPP_EVERYONE) || members.includes(own);
 }
 
 export interface QuickAnswerTarget {
@@ -162,6 +171,11 @@ export interface QuickAnswerTarget {
   readonly chatId: number;
   /** The site base URL, `config.siteUrl`. */
   readonly siteUrl: string;
+  /**
+   * The members of `support:miniapp:users` as lib/quick-answer-gate.ts read
+   * them; empty when the read failed.
+   */
+  readonly webAppMembers: readonly unknown[];
 }
 
 /**
@@ -169,11 +183,12 @@ export interface QuickAnswerTarget {
  *
  * Label and callback data for everyone outside the gate are byte-for-byte the
  * ones the bot used before, so their messages and the callback handler do not
- * change. The owner gets the same label opening the Mini App; if the URL is
- * unusable he silently gets the in-chat assistant rather than a broken menu.
+ * change. People inside it get the same label opening the Mini App; if the URL
+ * is unusable they silently get the in-chat assistant rather than a broken
+ * menu.
  */
 export function quickAnswerButton(target: QuickAnswerTarget): InlineKeyboardButton {
-  if (quickAnswerOpensWebApp(target.userId, target.chatId)) {
+  if (quickAnswerOpensWebApp(target.userId, target.chatId, target.webAppMembers)) {
     const url = quickAnswerWebAppUrl(target.siteUrl);
     if (url !== null) return { text: QUICK_ANSWER_LABEL, web_app: { url } };
   }
