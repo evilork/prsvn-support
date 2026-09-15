@@ -66,6 +66,7 @@ import {
   type FaqNode,
 } from './faq';
 import { ensureTopic, noteInTopic, relayClientToTopic, reopenTopic, syncTopicName } from './forum';
+import { keyboardOpensWebApp, quickAnswerButton, quickAnswerCallbackRetry } from './quick-answer';
 import {
   answerCallbackQuery,
   copyMessage,
@@ -97,7 +98,14 @@ import {
   touchTicket,
   type Ticket,
 } from './tickets';
-import type { TgCallbackQuery, TgMessage, TgUser, Update } from './types';
+import type {
+  InlineKeyboardButton,
+  TgCallbackQuery,
+  TgMessage,
+  TgResponse,
+  TgUser,
+  Update,
+} from './types';
 
 const RATE_LIMIT_MSG = 'Слишком много сообщений. Подождите минуту.';
 const BANNED_MSG = 'Вы заблокированы в поддержке.';
@@ -298,11 +306,81 @@ async function shouldAnswerWithAi(userId: number): Promise<boolean> {
 }
 
 async function showClientMenu(userId: number) {
-  const root = findNode('menu')!;
-  await sendMessage(userId, CLIENT_WELCOME, {
+  await showFaqMenu(userId, findNode('menu')!, CLIENT_WELCOME, null);
+}
+
+/**
+ * Put a client FAQ menu on screen: edit `messageId` in place, or send it anew
+ * when there is nothing to edit or the edit failed.
+ *
+ * The menu always lives in the person's private chat, so `userId` is also the
+ * chat id. For everyone outside the Mini App gate the Telegram calls are the
+ * ones the bot made before: one send, or an edit with a send as its fallback.
+ *
+ * The Mini App button adds one failure the local URL check cannot rule out:
+ * Telegram refusing the web_app button itself (BUTTON_TYPE_INVALID, a URL it
+ * does not take). That rejects the whole message, and the person would be left
+ * with no menu at all. So a 400 on a keyboard with a web_app button is logged
+ * and the menu is sent once more with the in-chat callback in its place. A
+ * network failure is not retried: the first send may have arrived, and a
+ * second menu would be worse than none being confirmed.
+ */
+async function showFaqMenu(
+  userId: number,
+  node: FaqNode,
+  text: string,
+  messageId: number | null,
+): Promise<void> {
+  const keyboard = buildFaqKeyboard(node, { ai: menuQuickAnswer(userId) });
+
+  let res: TgResponse<unknown> | null = null;
+  if (messageId !== null) {
+    res = await editMessageText(userId, messageId, text, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: keyboard },
+    });
+  }
+  if (res === null || !res.ok) {
+    res = await sendMessage(userId, text, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: keyboard },
+    });
+  }
+
+  if (res.ok) {
+    if (keyboardOpensWebApp(keyboard)) await endInChatModeForMiniApp(userId);
+    return;
+  }
+
+  const retry = quickAnswerCallbackRetry(keyboard, res);
+  if (retry === null) return;
+  console.error('[support] menu with the Mini App button rejected, resending with the callback:', res.description);
+  const again = await sendMessage(userId, text, {
     parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: buildFaqKeyboard(root, { ai: aiQuickAnswerEnabled(userId) }) },
+    reply_markup: { inline_keyboard: retry },
   });
+  if (!again.ok) console.error('[support] menu resend with the callback failed:', again.description);
+}
+
+/**
+ * End the in-chat assistant for someone whose menu now opens the Mini App.
+ *
+ * The menu is reached with the in-chat mode still on: /ai and every in-chat
+ * answer arm it, and «🏠 В меню» does not turn it off. From this menu the way
+ * into ProxysAI is the Mini App, and the Mini App cannot turn the mode off. If
+ * ProxysAI escalates there, the site sends the person back to this chat, and
+ * with the mode left on their next message would reach the assistant again
+ * instead of an operator. So the mode ends when such a menu is on screen.
+ *
+ * Its start is kept as the handoff mark first, the same way «Связаться со
+ * специалистом» does it: a ticket opened from here within half an hour still
+ * gets the conversation. Only for people inside the Mini App gate; everyone
+ * else's menu keeps the in-chat callback and their mode is untouched.
+ */
+async function endInChatModeForMiniApp(userId: number): Promise<void> {
+  if (!(await isAiMode(userId))) return;
+  await markAiHandoff(userId, await aiModeStartedAt(userId));
+  await disableAiMode(userId);
 }
 
 /**
@@ -608,6 +686,20 @@ const CONTACT_BUTTON = { text: '🆘 Связаться со специалис�
 const MENU_BUTTON = { text: '🏠 В меню', callback_data: 'faq:menu' } as const;
 
 /**
+ * «⚡ Быстрый ответ» for the FAQ menu, or null when this person does not see it.
+ *
+ * Visibility is still decided by `aiQuickAnswerEnabled` alone, as before; the
+ * Mini App gate (lib/quick-answer.ts) only changes what the visible button
+ * does. The client menu always goes to `chat_id = user id`, the private chat —
+ * the only place a web_app button is valid — so the chat id is the user id by
+ * construction. The operator group never gets this keyboard.
+ */
+function menuQuickAnswer(userId: number): InlineKeyboardButton | null {
+  if (!aiQuickAnswerEnabled(userId)) return null;
+  return quickAnswerButton({ userId, chatId: userId, siteUrl: config.siteUrl });
+}
+
+/**
  * Клавиатура под ответом помощника.
  *
  * Кнопки оператора здесь намеренно НЕТ: это окно разговора с помощником, и
@@ -616,6 +708,15 @@ const MENU_BUTTON = { text: '🏠 В меню', callback_data: 'faq:menu' } as c
  * словами, помощник передаёт сам, а «В меню» возвращает туда, где кнопка
  * оператора стоит постоянно. Под ОТКАЗОМ помощника кнопка остаётся — там она
  * единственный путь дальше, см. `aiFallbackKeyboard`.
+ *
+ * «⚡ Спросить ещё» stays the in-chat callback for everyone, the Mini App owner
+ * included: a conversation that started in the chat continues in the chat.
+ * Under an answer the in-chat mode (`support:aimode`) is on, and only the bot
+ * turns it off. The Mini App cannot. If ProxysAI escalates there, the site
+ * sends the person back to this chat, and with the mode still on their next
+ * message would reach the assistant again instead of an operator, with no
+ * ticket and no transcript. The Mini App opens only from the FAQ menu, and
+ * showing that menu turns the in-chat mode off (`endInChatModeForMiniApp`).
  */
 function aiReplyKeyboard() {
   return {
@@ -1397,18 +1498,7 @@ async function renderFaqNode(chatId: number, messageId: number, node: FaqNode) {
 
   // Клиентское меню всегда живёт в личке, так что chatId здесь — это и есть
   // идентификатор человека, которому решается показать «Быстрый ответ».
-  const keyboard = { inline_keyboard: buildFaqKeyboard(node, { ai: aiQuickAnswerEnabled(chatId) }) };
-
-  const res = await editMessageText(chatId, messageId, text, {
-    parse_mode: 'HTML',
-    reply_markup: keyboard,
-  });
-  if (!res.ok) {
-    await sendMessage(chatId, text, {
-      parse_mode: 'HTML',
-      reply_markup: keyboard,
-    });
-  }
+  await showFaqMenu(chatId, node, text, messageId);
 }
 
 async function handleAdminCallback(cb: TgCallbackQuery, data: string) {

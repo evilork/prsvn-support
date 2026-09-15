@@ -164,6 +164,11 @@ export interface InlineKeyboardButton {
   text: string;
   callback_data?: string;
   url?: string;
+  /**
+   * Opens a Mini App. Valid only in a private chat with the bot: in a group or
+   * a topic Telegram rejects the whole message (see lib/quick-answer.ts).
+   */
+  web_app?: { url: string };
 }
 
 export type InlineKeyboard = InlineKeyboardButton[][];
