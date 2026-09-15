@@ -3,7 +3,9 @@ import { NextRequest, NextResponse } from 'next/server';
 import { config } from '@/lib/config';
 import { askProxysAi } from '@/lib/ai';
 import { handleUpdate } from '@/lib/handler';
+import { OWNER_USER_ID } from '@/lib/owner';
 import { quickAnswerWebAppUrl } from '@/lib/quick-answer';
+import { describeQuickAnswerGate, quickAnswerGate } from '@/lib/quick-answer-gate';
 import type { Update } from '@/lib/types';
 
 export const runtime = 'nodejs';
@@ -70,6 +72,9 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ ok: true, probe: result, tookMs: Date.now() - started });
   }
 
+  // The same cached snapshot the menu uses on this instance; load() never rejects.
+  const gateSnapshot = await quickAnswerGate.load();
+
   return NextResponse.json({
     ok: true,
     service: 'proxysvpn-support-bot',
@@ -80,11 +85,20 @@ export async function GET(req: NextRequest) {
       adminUserIds: config.adminUserIds,
       forumMode: config.forumMode,
       siteUrl: config.siteUrl,
-      // The URL «⚡ Быстрый ответ» opens as the Mini App. `url: null` means
-      // SITE_URL is unusable for web_app and everyone, the owner included,
-      // gets the in-chat assistant — the same "button quietly differs" blind
-      // spot this endpoint exists for.
+      // Who gets «⚡ Быстрый ответ» as the Mini App, and the URL it opens.
+      //
+      // `gate` describes the site's Redis set in counts only, never member ids.
+      // `source: "unavailable"` means the read failed and everyone but the
+      // owner gets the in-chat assistant; `ignoredMembers` above zero is
+      // usually an id added without `tg_`. It is this instance's cache, up to
+      // `ttlMs` old, so an SADD shows here within a minute.
+      //
+      // `url: null` means SITE_URL is unusable for web_app and everyone, the
+      // owner included, gets the in-chat assistant — the same "button quietly
+      // differs" blind spot this endpoint exists for.
       quickAnswerWebApp: {
+        ownerUserId: OWNER_USER_ID,
+        gate: describeQuickAnswerGate(gateSnapshot, Date.now(), quickAnswerGate.ttlMs),
         url: quickAnswerWebAppUrl(config.siteUrl),
       },
     },

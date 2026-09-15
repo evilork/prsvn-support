@@ -22,7 +22,7 @@
 // clock; `quickAnswerGate` below is the instance the bot uses.
 
 import { Redis } from '@upstash/redis';
-import { QUICK_ANSWER_WEBAPP_USERS_KEY } from './quick-answer';
+import { QUICK_ANSWER_WEBAPP_USERS_KEY, summarizeQuickAnswerWebAppMembers } from './quick-answer';
 
 /**
  * How long one read of the set is trusted, ms.
@@ -172,6 +172,41 @@ export function createQuickAnswerGate(options: QuickAnswerGateOptions): QuickAns
       return inflight;
     },
   });
+}
+
+/** What the webhook probe shows about the gate: counts, never member ids. */
+export interface QuickAnswerGateReport {
+  /** The Redis key the gate reads. */
+  readonly key: string;
+  /** `unavailable`: the read failed and everyone but the owner gets the callback. */
+  readonly source: QuickAnswerGateSource;
+  /** `*` is in the set. */
+  readonly everyone: boolean;
+  /** Well-formed `tg_<id>` members. */
+  readonly membersCount: number;
+  /** Members that open nothing: a bare id, a typo, a non-string. */
+  readonly ignoredMembers: number;
+  /** How old the snapshot is, ms; never negative. */
+  readonly ageMs: number;
+  readonly ttlMs: number;
+}
+
+export function describeQuickAnswerGate(
+  snapshot: QuickAnswerGateSnapshot,
+  at: number,
+  ttlMs: number,
+): QuickAnswerGateReport {
+  const summary = summarizeQuickAnswerWebAppMembers(snapshot.members);
+  const age = at - snapshot.loadedAt;
+  return {
+    key: QUICK_ANSWER_WEBAPP_USERS_KEY,
+    source: snapshot.source,
+    everyone: summary.everyone,
+    membersCount: summary.users,
+    ignoredMembers: summary.ignored,
+    ageMs: Number.isFinite(age) && age > 0 ? age : 0,
+    ttlMs,
+  };
 }
 
 const redis = Redis.fromEnv();

@@ -251,6 +251,47 @@ test("a failed read closes the Mini App to all but the owner, never the menu", a
   assert.equal(log.lines.length, 1);
 });
 
+test("the probe report counts the set and names no one", () => {
+  const snapshot = Object.freeze({
+    members: Object.freeze(["*", "tg_42", "tg_6944217115", 6944217115]),
+    source: "redis",
+    loadedAt: T0,
+  });
+  const report = gateModule.describeQuickAnswerGate(snapshot, T0 + 1_234, TTL);
+  assert.deepEqual(report, {
+    key: "support:miniapp:users",
+    source: "redis",
+    everyone: true,
+    membersCount: 2,
+    ignoredMembers: 1,
+    ageMs: 1_234,
+    ttlMs: TTL,
+  });
+  const json = JSON.stringify(report);
+  assert.ok(!json.includes("tg_"), json);
+  assert.ok(!json.includes("6944217115"), json);
+  assert.ok(!/\b42\b/.test(json), json);
+});
+
+test("the probe report of a failed read says so", async () => {
+  const { gate, clock } = gateWith([new Error("down")]);
+  const snapshot = await gate.load();
+  clock.advance(5_000);
+  assert.deepEqual(gateModule.describeQuickAnswerGate(snapshot, clock.now(), gate.ttlMs), {
+    key: "support:miniapp:users",
+    source: "unavailable",
+    everyone: false,
+    membersCount: 0,
+    ignoredMembers: 0,
+    ageMs: 5_000,
+    ttlMs: TTL,
+  });
+  // A clock behind the snapshot reports zero age, never a negative one.
+  for (const at of [T0 - 10, Number.NaN]) {
+    assert.equal(gateModule.describeQuickAnswerGate(snapshot, at, TTL).ageMs, 0, String(at));
+  }
+});
+
 test("the bot's own gate fails closed on a Redis it cannot use", async (t) => {
   // The stubbed Upstash client throws on any use, as a broken one would.
   const errors = t.mock.method(console, "error", () => {});
