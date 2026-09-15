@@ -7,7 +7,8 @@
 // as a Telegram Mini App instead — `${SITE_URL}/tg/support`, the dashboard's
 // chat running inside Telegram. The gate is the site's own switch, the Redis
 // set `support:miniapp:users`, so one SADD or SREM opens or closes the Mini
-// App on both surfaces at once.
+// App on both surfaces at once. `*` means here what it means on the site:
+// everyone with an account (see `quickAnswerWebAppAccess`).
 //
 // Only the menu button. "⚡ Спросить ещё" under an in-chat answer stays the
 // `ai:more` callback for everyone: that conversation has the in-chat mode on,
@@ -15,10 +16,11 @@
 // person back to a chat where the assistant still intercepts their messages
 // (see `aiReplyKeyboard` in lib/handler.ts).
 //
-// Pure on purpose: no config, no Redis, no network. The set's members come in
-// as an argument (lib/quick-answer-gate.ts reads them, cached and failing
-// closed); lib/config.ts throws on import without the bot's secrets, and this
-// gate is what has to be tested.
+// Pure on purpose: no config, no Redis, no network. The set's members and
+// whether the person has a site account come in as arguments
+// (lib/quick-answer-gate.ts reads both, cached and failing closed);
+// lib/config.ts throws on import without the bot's secrets, and this gate is
+// what has to be tested.
 
 import { OWNER_USER_ID } from './owner';
 import type { InlineKeyboard, InlineKeyboardButton } from './types';
@@ -132,17 +134,38 @@ export function quickAnswerWebAppUrl(siteUrl: string): string | null {
 }
 
 /**
- * Whether this person, in this chat, is given the Mini App.
+ * What the set alone decides for this person, in this chat.
  *
- * `members` is what `support:miniapp:users` holds — the site's set, the one
- * its dashboard button reads — or an empty list when it could not be read:
+ * - `webapp`: the Mini App, nothing more to check;
+ * - `account`: only `*` opens it, so the Mini App only if this Telegram
+ *   reaches an account on the site, the in-chat callback otherwise;
+ * - `callback`: the in-chat assistant.
+ */
+export type QuickAnswerWebAppAccess = 'webapp' | 'account' | 'callback';
+
+/**
+ * Who the Mini App is open to, from what `support:miniapp:users` holds — the
+ * site's set, the one its dashboard button reads — or an empty list when it
+ * could not be read:
  *
  * - the owner always, whatever the set holds and whether it was read at all:
  *   the gate must not lock out the person checking it, and a new screen is
  *   his to look at first;
- * - `*` in the set opens it to everyone;
- * - `tg_<id>` opens it to that person;
+ * - `tg_<id>` opens it to that person: the owner named them;
+ * - `*` opens it to everyone with an account on the site (`account`);
  * - anyone else keeps the in-chat callback.
+ *
+ * Why `*` needs an account. On the site `*` reaches only people signed in to
+ * the dashboard, so there it already means "everyone with an account". The
+ * bot reaches people the site has never seen, and the Mini App's sign-in
+ * creates an empty free account for them. Two things go wrong without the
+ * condition. A stranger leaves /api/internal/support-ai — 5 model calls a day
+ * without an account, a daily ceiling on the whole channel — for the
+ * dashboard's chat route, 40 a day and no ceiling. And a customer whose
+ * account is on email, with this Telegram not linked, gets ProxysAI reading
+ * that new empty account ("balance 0, no devices") instead of being told the
+ * account was not found. Both keep the in-chat assistant, which handles
+ * exactly that case.
  *
  * A web_app inline button is valid only in a private chat with the bot; in a
  * group or a forum topic Telegram rejects the whole message. A private chat's
@@ -151,17 +174,36 @@ export function quickAnswerWebAppUrl(siteUrl: string): string | null {
  *
  * O(n) in the size of the set.
  */
+export function quickAnswerWebAppAccess(
+  userId: number,
+  chatId: number,
+  members: readonly unknown[],
+): QuickAnswerWebAppAccess {
+  const own = quickAnswerWebAppMember(userId);
+  if (own === null) return 'callback';
+  if (chatId !== userId) return 'callback';
+  if (userId === OWNER_USER_ID) return 'webapp';
+  if (!Array.isArray(members)) return 'callback';
+  if (members.includes(own)) return 'webapp';
+  if (members.includes(QUICK_ANSWER_WEBAPP_EVERYONE)) return 'account';
+  return 'callback';
+}
+
+/**
+ * Whether this person, in this chat, is given the Mini App.
+ *
+ * `hasSiteAccount` matters only when `quickAnswerWebAppAccess` says `account`;
+ * anything but `true` there keeps the callback, so a lookup that was skipped
+ * or failed closes the Mini App rather than opening it.
+ */
 export function quickAnswerOpensWebApp(
   userId: number,
   chatId: number,
   members: readonly unknown[],
+  hasSiteAccount: boolean,
 ): boolean {
-  const own = quickAnswerWebAppMember(userId);
-  if (own === null) return false;
-  if (chatId !== userId) return false;
-  if (userId === OWNER_USER_ID) return true;
-  if (!Array.isArray(members)) return false;
-  return members.includes(QUICK_ANSWER_WEBAPP_EVERYONE) || members.includes(own);
+  const access = quickAnswerWebAppAccess(userId, chatId, members);
+  return access === 'webapp' || (access === 'account' && hasSiteAccount === true);
 }
 
 export interface QuickAnswerTarget {
@@ -176,6 +218,12 @@ export interface QuickAnswerTarget {
    * them; empty when the read failed.
    */
   readonly webAppMembers: readonly unknown[];
+  /**
+   * Whether this Telegram reaches an account on the site, as
+   * lib/quick-answer-gate.ts looked it up. Consulted only when `*` alone would
+   * open the Mini App; false when it was not looked up or the lookup failed.
+   */
+  readonly hasSiteAccount: boolean;
 }
 
 /**
@@ -188,7 +236,7 @@ export interface QuickAnswerTarget {
  * menu.
  */
 export function quickAnswerButton(target: QuickAnswerTarget): InlineKeyboardButton {
-  if (quickAnswerOpensWebApp(target.userId, target.chatId, target.webAppMembers)) {
+  if (quickAnswerOpensWebApp(target.userId, target.chatId, target.webAppMembers, target.hasSiteAccount)) {
     const url = quickAnswerWebAppUrl(target.siteUrl);
     if (url !== null) return { text: QUICK_ANSWER_LABEL, web_app: { url } };
   }

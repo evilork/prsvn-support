@@ -1,10 +1,10 @@
 // tests/quick-answer.test.mjs
 //
 // quickAnswerButton: who gets the ProxysAI Mini App as a web_app button follows
-// the site's Redis set support:miniapp:users — the owner always, "*" everyone,
-// "tg_<id>" one person — and only in their private chat. Everyone else, every
-// non-private chat and every unusable SITE_URL keep the in-chat callback
-// exactly as before.
+// the site's Redis set support:miniapp:users — the owner always, "tg_<id>" one
+// person, "*" everyone with an account on the site — and only in their private
+// chat. Everyone else, every non-private chat and every unusable SITE_URL keep
+// the in-chat callback exactly as before.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -20,6 +20,7 @@ const {
   quickAnswerButton,
   quickAnswerCallbackRetry,
   quickAnswerOpensWebApp,
+  quickAnswerWebAppAccess,
   quickAnswerWebAppMember,
   quickAnswerWebAppUrl,
   summarizeQuickAnswerWebAppMembers,
@@ -34,7 +35,13 @@ const OPERATOR_GROUP = -1001234567890;
 const NOBODY = [];
 const EVERYONE = ["*"];
 
-const inOwnChat = (userId, webAppMembers = NOBODY, siteUrl = SITE) => ({ userId, chatId: userId, siteUrl, webAppMembers });
+const inOwnChat = (userId, webAppMembers = NOBODY, siteUrl = SITE, hasSiteAccount = false) => ({
+  userId,
+  chatId: userId,
+  siteUrl,
+  webAppMembers,
+  hasSiteAccount,
+});
 
 const CALLBACK_OPEN = { text: "⚡ Быстрый ответ", callback_data: "ai" };
 const WEB_APP_OPEN = { text: "⚡ Быстрый ответ", web_app: { url: MINI_APP } };
@@ -65,37 +72,83 @@ test("only the menu button can open the Mini App, never «Спросить ещ�
   assert.equal(quickAnswerButton.length, 1);
 });
 
+test("what the set alone decides", () => {
+  const cases = [
+    // [userId, chatId, members, expected]
+    [OWNER, OWNER, NOBODY, "webapp"],
+    [OWNER, OWNER, null, "webapp"],
+    [42, 42, ["tg_42"], "webapp"],
+    // A named member needs no account lookup, "*" beside it or not.
+    [42, 42, ["*", "tg_42"], "webapp"],
+    [42, 42, EVERYONE, "account"],
+    [42, 42, ["tg_43", "*"], "account"],
+    [42, 42, NOBODY, "callback"],
+    [42, 42, ["tg_43"], "callback"],
+    [42, 42, "*", "callback"],
+    [42, 42, undefined, "callback"],
+    [42, OPERATOR_GROUP, ["*", "tg_42"], "callback"],
+    [OWNER, OPERATOR_GROUP, NOBODY, "callback"],
+    [0, 0, EVERYONE, "callback"],
+  ];
+  for (const [userId, chatId, members, expected] of cases) {
+    assert.equal(quickAnswerWebAppAccess(userId, chatId, members), expected, `${userId} ${chatId} ${JSON.stringify(members)}`);
+  }
+});
+
 test("the owner always gets the Mini App, whatever the set holds or if it was not read", () => {
   assert.equal(OWNER_USER_ID, OWNER);
   // An empty list is also what the gate hands over when Redis failed.
   for (const members of [NOBODY, EVERYONE, ["tg_42"], [OWNER], null, undefined, "*"]) {
-    assert.deepEqual(quickAnswerButton(inOwnChat(OWNER, members)), WEB_APP_OPEN, String(members));
-    assert.equal(quickAnswerOpensWebApp(OWNER, OWNER, members), true, String(members));
+    for (const hasSiteAccount of [false, true]) {
+      assert.deepEqual(quickAnswerButton(inOwnChat(OWNER, members, SITE, hasSiteAccount)), WEB_APP_OPEN, String(members));
+      assert.equal(quickAnswerOpensWebApp(OWNER, OWNER, members, hasSiteAccount), true, String(members));
+    }
   }
 });
 
-test('"*" opens the Mini App to everyone in their private chat', () => {
+test('"*" opens the Mini App to everyone with a site account, in their private chat', () => {
   for (const userId of [1, 42, 123456789, OWNER - 1, OWNER + 1, 7_000_000_000]) {
-    assert.deepEqual(quickAnswerButton(inOwnChat(userId, EVERYONE)), WEB_APP_OPEN, String(userId));
-    assert.equal(quickAnswerOpensWebApp(userId, userId, ["tg_2", "*", "tg_3"]), true, String(userId));
+    assert.deepEqual(quickAnswerButton(inOwnChat(userId, EVERYONE, SITE, true)), WEB_APP_OPEN, String(userId));
+    assert.equal(quickAnswerOpensWebApp(userId, userId, ["tg_2", "*", "tg_3"], true), true, String(userId));
   }
 });
 
-test('"tg_<id>" opens the Mini App to that person only', () => {
+test('"*" keeps the in-chat callback for a Telegram the site has never seen', () => {
+  // The Mini App would sign such a person in by creating an empty account:
+  // strangers would leave the capped in-chat channel, and an email customer
+  // would get ProxysAI reading an empty account instead of "not found".
+  for (const userId of [1, 42, 123456789, OWNER - 1, OWNER + 1, 7_000_000_000]) {
+    assert.deepEqual(quickAnswerButton(inOwnChat(userId, EVERYONE)), CALLBACK_OPEN, String(userId));
+    assert.equal(quickAnswerOpensWebApp(userId, userId, EVERYONE, false), false, String(userId));
+  }
+  // Only a real `true` counts: a skipped or mistyped lookup closes the Mini App.
+  for (const hasSiteAccount of [undefined, null, 1, "true", {}]) {
+    const target = { userId: 42, chatId: 42, siteUrl: SITE, webAppMembers: EVERYONE, hasSiteAccount };
+    assert.deepEqual(quickAnswerButton(target), CALLBACK_OPEN, JSON.stringify(hasSiteAccount));
+    assert.equal(quickAnswerOpensWebApp(42, 42, EVERYONE, hasSiteAccount), false, JSON.stringify(hasSiteAccount));
+  }
+});
+
+test('"tg_<id>" opens the Mini App to that person only, account or not', () => {
   const members = ["tg_42", "tg_123456789"];
-  assert.deepEqual(quickAnswerButton(inOwnChat(42, members)), WEB_APP_OPEN);
-  assert.deepEqual(quickAnswerButton(inOwnChat(123456789, members)), WEB_APP_OPEN);
-  for (const userId of [1, 2, 4, 43, 420, 12345678, 1234567890]) {
-    assert.deepEqual(quickAnswerButton(inOwnChat(userId, members)), CALLBACK_OPEN, String(userId));
-    assert.equal(quickAnswerOpensWebApp(userId, userId, members), false, String(userId));
+  for (const hasSiteAccount of [false, true]) {
+    assert.deepEqual(quickAnswerButton(inOwnChat(42, members, SITE, hasSiteAccount)), WEB_APP_OPEN);
+    assert.deepEqual(quickAnswerButton(inOwnChat(123456789, members, SITE, hasSiteAccount)), WEB_APP_OPEN);
+    for (const userId of [1, 2, 4, 43, 420, 12345678, 1234567890]) {
+      assert.deepEqual(quickAnswerButton(inOwnChat(userId, members, SITE, hasSiteAccount)), CALLBACK_OPEN, String(userId));
+      assert.equal(quickAnswerOpensWebApp(userId, userId, members, hasSiteAccount), false, String(userId));
+    }
   }
 });
 
-test("everyone outside the set keeps the in-chat callback, unchanged", () => {
+test("everyone outside the set keeps the in-chat callback, unchanged, account or not", () => {
   for (const userId of [1, 42, 123456789, OWNER - 1, OWNER + 1, 7_000_000_000]) {
     for (const members of [NOBODY, ["tg_5"], null, undefined, "*", { 0: "*" }]) {
-      assert.deepEqual(quickAnswerButton(inOwnChat(userId, members)), CALLBACK_OPEN, `${userId} ${String(members)}`);
-      assert.equal(quickAnswerOpensWebApp(userId, userId, members), false, `${userId} ${String(members)}`);
+      for (const hasSiteAccount of [false, true]) {
+        const label = `${userId} ${String(members)} ${hasSiteAccount}`;
+        assert.deepEqual(quickAnswerButton(inOwnChat(userId, members, SITE, hasSiteAccount)), CALLBACK_OPEN, label);
+        assert.equal(quickAnswerOpensWebApp(userId, userId, members, hasSiteAccount), false, label);
+      }
     }
   }
 });
@@ -104,19 +157,19 @@ test("members the site would not accept open nothing", () => {
   // Upstash hands a bare numeric member back as a number.
   const nearMisses = [42, "42", "tg_042", "TG_42", "tg-42", " tg_42", "tg_42 ", "tg_42\n", "**", " *", "all", "tg_*", "", null, ["tg_42"], ["*"]];
   for (const member of nearMisses) {
-    assert.deepEqual(quickAnswerButton(inOwnChat(42, [member])), CALLBACK_OPEN, JSON.stringify(member));
+    assert.deepEqual(quickAnswerButton(inOwnChat(42, [member], SITE, true)), CALLBACK_OPEN, JSON.stringify(member));
   }
 });
 
 test("outside a private chat nobody gets web_app, not the owner and not with \"*\"", () => {
   for (const chatId of [OPERATOR_GROUP, -OWNER, 123456789, 0, Number.NaN]) {
     for (const webAppMembers of [NOBODY, EVERYONE]) {
-      const target = { userId: OWNER, chatId, siteUrl: SITE, webAppMembers };
+      const target = { userId: OWNER, chatId, siteUrl: SITE, webAppMembers, hasSiteAccount: true };
       assert.deepEqual(quickAnswerButton(target), CALLBACK_OPEN, String(chatId));
     }
   }
   for (const chatId of [OPERATOR_GROUP, -42, 43]) {
-    const target = { userId: 42, chatId, siteUrl: SITE, webAppMembers: ["*", "tg_42"] };
+    const target = { userId: 42, chatId, siteUrl: SITE, webAppMembers: ["*", "tg_42"], hasSiteAccount: true };
     assert.deepEqual(quickAnswerButton(target), CALLBACK_OPEN, String(chatId));
   }
 });
@@ -126,7 +179,7 @@ test("missing SITE_URL falls back to the callback", () => {
   for (const siteUrl of ["", "   ", undefined, null]) {
     assert.equal(quickAnswerWebAppUrl(siteUrl), null, String(siteUrl));
     for (const userId of [OWNER, 42]) {
-      const target = { userId, chatId: userId, siteUrl, webAppMembers: EVERYONE };
+      const target = { userId, chatId: userId, siteUrl, webAppMembers: EVERYONE, hasSiteAccount: true };
       assert.deepEqual(quickAnswerButton(target), CALLBACK_OPEN, `${userId} ${String(siteUrl)}`);
     }
   }
@@ -150,7 +203,7 @@ test("unusable SITE_URL falls back: Telegram would reject the whole menu", () =>
   ]) {
     assert.equal(quickAnswerWebAppUrl(siteUrl), null, siteUrl);
     assert.deepEqual(quickAnswerButton(inOwnChat(OWNER, NOBODY, siteUrl)), CALLBACK_OPEN, siteUrl);
-    assert.deepEqual(quickAnswerButton(inOwnChat(42, EVERYONE, siteUrl)), CALLBACK_OPEN, siteUrl);
+    assert.deepEqual(quickAnswerButton(inOwnChat(42, EVERYONE, siteUrl, true)), CALLBACK_OPEN, siteUrl);
   }
 });
 
@@ -162,17 +215,24 @@ test("usable SITE_URL spellings give the same Mini App URL", () => {
   assert.equal(quickAnswerWebAppUrl("https://example.com/base/"), "https://example.com/base/tg/support");
 });
 
-test("malformed user ids never open the Mini App, even with \"*\"", () => {
+test("malformed user ids never open the Mini App, even with \"*\" and an account", () => {
   const members = ["*", "tg_0", "tg_-1", "tg_NaN", "tg_undefined", "tg_null"];
   for (const userId of [0, -1, -OWNER, Number.NaN, Number.POSITIVE_INFINITY, OWNER + 0.5, String(OWNER), null, undefined]) {
-    assert.equal(quickAnswerOpensWebApp(userId, userId, members), false, String(userId));
-    const target = { userId, chatId: userId, siteUrl: SITE, webAppMembers: members };
+    assert.equal(quickAnswerWebAppAccess(userId, userId, members), "callback", String(userId));
+    assert.equal(quickAnswerOpensWebApp(userId, userId, members, true), false, String(userId));
+    const target = { userId, chatId: userId, siteUrl: SITE, webAppMembers: members, hasSiteAccount: true };
     assert.deepEqual(quickAnswerButton(target), CALLBACK_OPEN, String(userId));
   }
 });
 
 test("a button carries exactly one action", () => {
-  for (const target of [inOwnChat(OWNER), inOwnChat(42), inOwnChat(42, EVERYONE), inOwnChat(OWNER, NOBODY, "")]) {
+  for (const target of [
+    inOwnChat(OWNER),
+    inOwnChat(42),
+    inOwnChat(42, EVERYONE),
+    inOwnChat(42, EVERYONE, SITE, true),
+    inOwnChat(OWNER, NOBODY, ""),
+  ]) {
     const button = quickAnswerButton(target);
     const actions = ["callback_data", "web_app", "url"].filter((key) => key in button);
     assert.equal(actions.length, 1, `${target.userId} (${target.siteUrl})`);

@@ -66,8 +66,13 @@ import {
   type FaqNode,
 } from './faq';
 import { ensureTopic, noteInTopic, relayClientToTopic, reopenTopic, syncTopicName } from './forum';
-import { keyboardOpensWebApp, quickAnswerButton, quickAnswerCallbackRetry } from './quick-answer';
-import { quickAnswerGate } from './quick-answer-gate';
+import {
+  keyboardOpensWebApp,
+  quickAnswerButton,
+  quickAnswerCallbackRetry,
+  quickAnswerWebAppAccess,
+} from './quick-answer';
+import { quickAnswerAccountCheck, quickAnswerGate } from './quick-answer-gate';
 import {
   answerCallbackQuery,
   copyMessage,
@@ -697,15 +702,25 @@ const MENU_BUTTON = { text: '🏠 В меню', callback_data: 'faq:menu' } as c
  * menu always goes to `chat_id = user id`, the private chat — the only place a
  * web_app button is valid — so the chat id is the user id by construction. The
  * operator group never gets this keyboard.
+ *
+ * `*` opens the Mini App only to someone whose Telegram reaches an account on
+ * the site (see `quickAnswerWebAppAccess` for why). That lookup is made only
+ * when `*` alone decides: the owner, a `tg_<id>` member and everyone outside
+ * the set cost nothing beyond the cached set, and the lookup itself is cached
+ * per person for the same minute and fails closed to the callback.
  */
 async function menuQuickAnswer(userId: number): Promise<InlineKeyboardButton | null> {
   if (!aiQuickAnswerEnabled(userId)) return null;
   const gate = await quickAnswerGate.load();
+  const hasSiteAccount =
+    quickAnswerWebAppAccess(userId, userId, gate.members) === 'account' &&
+    (await quickAnswerAccountCheck.has(userId));
   return quickAnswerButton({
     userId,
     chatId: userId,
     siteUrl: config.siteUrl,
     webAppMembers: gate.members,
+    hasSiteAccount,
   });
 }
 

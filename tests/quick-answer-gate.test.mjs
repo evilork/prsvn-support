@@ -241,8 +241,15 @@ test("a failed read closes the Mini App to all but the owner, never the menu", a
   const WEB_APP_OPEN = { text: "⚡ Быстрый ответ", web_app: { url: `${SITE}/tg/support` } };
   const CALLBACK_OPEN = { text: "⚡ Быстрый ответ", callback_data: "ai" };
   const { gate, clock, log } = gateWith([["*"], new Error("down")]);
+  // hasSiteAccount: true, so only the set's read decides here.
   const menuButton = async (userId) =>
-    quickAnswerButton({ userId, chatId: userId, siteUrl: SITE, webAppMembers: (await gate.load()).members });
+    quickAnswerButton({
+      userId,
+      chatId: userId,
+      siteUrl: SITE,
+      webAppMembers: (await gate.load()).members,
+      hasSiteAccount: true,
+    });
 
   assert.deepEqual(await menuButton(42), WEB_APP_OPEN);
   clock.advance(TTL);
