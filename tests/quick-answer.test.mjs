@@ -158,6 +158,33 @@ test("no retry unless Telegram itself rejected a keyboard with web_app", () => {
   }
 });
 
+test("the allowlist is the site's Redis set, spelled as the site spells it", () => {
+  // src/lib/support-miniapp-access.ts on the frontend: the same key, "*" for
+  // everyone, "tg_<telegram id>" for one person.
+  assert.equal(quickAnswer.QUICK_ANSWER_WEBAPP_USERS_KEY, "support:miniapp:users");
+  assert.equal(quickAnswer.QUICK_ANSWER_WEBAPP_EVERYONE, "*");
+  assert.equal(quickAnswer.quickAnswerWebAppMember(OWNER), "tg_6944217115");
+  assert.equal(quickAnswer.quickAnswerWebAppMember(42), "tg_42");
+  for (const userId of [0, -1, -OWNER, 1.5, Number.NaN, Number.POSITIVE_INFINITY, 2 ** 53, String(OWNER), null, undefined]) {
+    assert.equal(quickAnswer.quickAnswerWebAppMember(userId), null, String(userId));
+  }
+});
+
+test("the members summary counts without naming anyone", () => {
+  const { summarizeQuickAnswerWebAppMembers: summarize } = quickAnswer;
+  assert.deepEqual(summarize([]), { everyone: false, users: 0, ignored: 0 });
+  assert.deepEqual(summarize(["*"]), { everyone: true, users: 0, ignored: 0 });
+  assert.deepEqual(summarize(["tg_42", "tg_6944217115", "*"]), { everyone: true, users: 2, ignored: 0 });
+  // A bare id comes back from Upstash as a number; neither side accepts it.
+  assert.deepEqual(
+    summarize([6944217115, "6944217115", "tg_", "tg_0", "tg_01", "TG_42", " tg_42", "tg_42 ", "tg_9007199254740993", "**", "all", null, {}]),
+    { everyone: false, users: 0, ignored: 13 },
+  );
+  for (const notAList of [null, undefined, "*", { 0: "*" }]) {
+    assert.deepEqual(summarize(notAList), { everyone: false, users: 0, ignored: 0 }, String(notAList));
+  }
+});
+
 test("the retry drops a foreign web_app button and the row it empties", () => {
   const foreign = { text: "Other app", web_app: { url: "https://example.com/app" } };
   const keyboard = [[SECTION, foreign], [foreign], [WEB_APP_OPEN], [CONTACT]];

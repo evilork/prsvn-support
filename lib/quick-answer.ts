@@ -43,6 +43,78 @@ export const QUICK_ANSWER_LABEL = '⚡ Быстрый ответ';
 export const QUICK_ANSWER_CALLBACK = 'ai';
 
 /**
+ * The Redis set that opens the Mini App, shared with the site.
+ *
+ * The dashboard's support button reads the same key
+ * (src/lib/support-miniapp-access.ts on the frontend), so one switch controls
+ * both surfaces, without a deploy of either:
+ *
+ *   SADD support:miniapp:users tg_<telegram id>   one more person
+ *   SADD support:miniapp:users "*"                everyone
+ *   SREM support:miniapp:users "*"                back to the list
+ */
+export const QUICK_ANSWER_WEBAPP_USERS_KEY = 'support:miniapp:users';
+
+/** Set member that opens the Mini App to everyone. */
+export const QUICK_ANSWER_WEBAPP_EVERYONE = '*';
+
+/** A well-formed per-person member: the site's account id for a Telegram user. */
+const WEBAPP_MEMBER_RE = /^tg_[1-9]\d*$/;
+
+/**
+ * The set member that opens the Mini App to one Telegram user, or null for an
+ * id that no Telegram user can have.
+ *
+ * `tg_<id>` is how the site names accounts created through Telegram, and the
+ * site checks exactly that string; a bare id in the set opens nothing on
+ * either side.
+ */
+export function quickAnswerWebAppMember(userId: number): string | null {
+  if (!Number.isSafeInteger(userId) || userId <= 0) return null;
+  return `tg_${userId}`;
+}
+
+export interface QuickAnswerWebAppMembersSummary {
+  /** `*` is in the set. */
+  readonly everyone: boolean;
+  /** Well-formed `tg_<id>` members. */
+  readonly users: number;
+  /** Anything else — a bare id, a typo, a non-string — which opens nothing. */
+  readonly ignored: number;
+}
+
+/**
+ * What the set holds, as counts only.
+ *
+ * For diagnostics: an `ignored` above zero is the usual reason someone added
+ * to the set still sees the old button (`SADD … 6944217115` without `tg_`).
+ * No ids are returned. O(n) in the size of the set.
+ */
+export function summarizeQuickAnswerWebAppMembers(
+  members: readonly unknown[],
+): QuickAnswerWebAppMembersSummary {
+  let everyone = false;
+  let users = 0;
+  let ignored = 0;
+  if (!Array.isArray(members)) return { everyone, users, ignored };
+
+  for (const member of members) {
+    if (member === QUICK_ANSWER_WEBAPP_EVERYONE) {
+      everyone = true;
+    } else if (
+      typeof member === 'string' &&
+      WEBAPP_MEMBER_RE.test(member) &&
+      Number.isSafeInteger(Number(member.slice(3)))
+    ) {
+      users += 1;
+    } else {
+      ignored += 1;
+    }
+  }
+  return { everyone, users, ignored };
+}
+
+/**
  * The Mini App URL for a site base URL, or null when Telegram would not take it.
  *
  * Null is not cosmetic. An unusable web_app URL makes Telegram reject the WHOLE
