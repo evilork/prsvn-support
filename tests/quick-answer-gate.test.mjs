@@ -246,7 +246,7 @@ test("a failed read closes the Mini App to all but the owner, never the menu", a
     quickAnswerButton({
       userId,
       chatId: userId,
-      siteUrl: SITE,
+      miniAppUrl: SITE,
       webAppMembers: (await gate.load()).members,
       hasSiteAccount: true,
     });

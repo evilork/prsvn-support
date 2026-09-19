@@ -97,13 +97,13 @@ export async function GET(req: NextRequest) {
       // account on the site, as the dashboard button does; a Telegram the site
       // has never seen still gets the in-chat assistant (lib/quick-answer.ts).
       //
-      // `url: null` means SITE_URL is unusable for web_app and everyone, the
+      // `url: null` means MINIAPP_SITE_URL is unusable for web_app and everyone, the
       // owner included, gets the in-chat assistant — the same "button quietly
       // differs" blind spot this endpoint exists for.
       quickAnswerWebApp: {
         ownerUserId: OWNER_USER_ID,
         gate: describeQuickAnswerGate(gateSnapshot, Date.now(), quickAnswerGate.ttlMs),
-        url: quickAnswerWebAppUrl(config.siteUrl),
+        url: quickAnswerWebAppUrl(config.miniAppUrl),
       },
     },
   });

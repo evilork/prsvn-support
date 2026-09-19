@@ -718,7 +718,7 @@ async function menuQuickAnswer(userId: number): Promise<InlineKeyboardButton | n
   return quickAnswerButton({
     userId,
     chatId: userId,
-    siteUrl: config.siteUrl,
+    miniAppUrl: config.miniAppUrl,
     webAppMembers: gate.members,
     hasSiteAccount,
   });

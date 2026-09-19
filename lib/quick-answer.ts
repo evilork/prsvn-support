@@ -110,14 +110,14 @@ export function summarizeQuickAnswerWebAppMembers(
  * The Mini App URL for a site base URL, or null when Telegram would not take it.
  *
  * Null is not cosmetic. An unusable web_app URL makes Telegram reject the WHOLE
- * message, so a bad SITE_URL would cost the person the entire FAQ menu, not
+ * message, so a bad MINIAPP_SITE_URL would cost the person the entire FAQ menu, not
  * just one button. Hence: https only (Telegram's own requirement), a real host,
  * no credentials, no query or fragment to glue the path onto. A path prefix is
  * kept, the same way lib/ai.ts appends its API path to SITE_URL.
  */
-export function quickAnswerWebAppUrl(siteUrl: string): string | null {
-  if (typeof siteUrl !== 'string') return null;
-  const raw = siteUrl.trim();
+export function quickAnswerWebAppUrl(baseUrl: string): string | null {
+  if (typeof baseUrl !== 'string') return null;
+  const raw = baseUrl.trim();
   if (!raw || /[\s?#]/.test(raw)) return null;
 
   let parsed: URL;
@@ -211,8 +211,14 @@ export interface QuickAnswerTarget {
   readonly userId: number;
   /** The chat the keyboard is sent to. */
   readonly chatId: number;
-  /** The site base URL, `config.siteUrl`. */
-  readonly siteUrl: string;
+  /**
+   * The base URL the Mini App is served from, `config.miniAppUrl`.
+   *
+   * Not `config.siteUrl`: Telegram's webview loads this page over the person's
+   * own network, so it meets the same filtering the site does, and the reserve
+   * host is the name that passes it. Both hosts serve the same deployment.
+   */
+  readonly miniAppUrl: string;
   /**
    * The members of `support:miniapp:users` as lib/quick-answer-gate.ts read
    * them; empty when the read failed.
@@ -237,7 +243,7 @@ export interface QuickAnswerTarget {
  */
 export function quickAnswerButton(target: QuickAnswerTarget): InlineKeyboardButton {
   if (quickAnswerOpensWebApp(target.userId, target.chatId, target.webAppMembers, target.hasSiteAccount)) {
-    const url = quickAnswerWebAppUrl(target.siteUrl);
+    const url = quickAnswerWebAppUrl(target.miniAppUrl);
     if (url !== null) return { text: QUICK_ANSWER_LABEL, web_app: { url } };
   }
   return { text: QUICK_ANSWER_LABEL, callback_data: QUICK_ANSWER_CALLBACK };
