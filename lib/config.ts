@@ -152,6 +152,21 @@ export const config = {
   ticketDataTtlSec: 60 * 60 * 24 * 180,
 
   siteUrl: process.env.SITE_URL || 'https://proxysvpn.com',
+
+  /**
+   * Откуда отдаётся Mini App «⚡ Быстрый ответ» (`/tg/support`).
+   *
+   * Это НЕ `siteUrl`, и намеренно. Страницу мини-приложения грузит браузер
+   * Telegram по сети человека, поэтому её режут ровно там же, где сайт: с
+   * 09.09.2026 часть российских провайдеров узнаёт наш бренд в рукопожатии
+   * TLS и рвёт поток, а 19.09.2026 у тестера в Крыму из всех наших имён
+   * открывалось только запасное. Приложение за запасным именем то же самое,
+   * тот же проект и тот же деплой (на сайте — lib/reserve-site.ts).
+   *
+   * `siteUrl` это не трогает: по нему бот ходит в ручку
+   * `/api/internal/support-ai` с сервера на сервер, мимо чьей-либо сети.
+   */
+  miniAppUrl: process.env.MINIAPP_SITE_URL || 'https://proxysvnovich.vercel.app',
   dashboardUrl: process.env.DASHBOARD_URL || 'https://proxysvpn.com/dashboard',
   guideUrl: process.env.GUIDE_URL || 'https://proxysvpn.com/guide',
   mainBotUrl: process.env.MAIN_BOT_URL || 'https://t.me/proxysvpn_bot',

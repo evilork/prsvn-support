@@ -3,7 +3,7 @@
 // quickAnswerButton: who gets the ProxysAI Mini App as a web_app button follows
 // the site's Redis set support:miniapp:users — the owner always, "tg_<id>" one
 // person, "*" everyone with an account on the site — and only in their private
-// chat. Everyone else, every non-private chat and every unusable SITE_URL keep
+// chat. Everyone else, every non-private chat and every unusable base URL keep
 // the in-chat callback exactly as before.
 
 import { test } from "node:test";
@@ -35,10 +35,10 @@ const OPERATOR_GROUP = -1001234567890;
 const NOBODY = [];
 const EVERYONE = ["*"];
 
-const inOwnChat = (userId, webAppMembers = NOBODY, siteUrl = SITE, hasSiteAccount = false) => ({
+const inOwnChat = (userId, webAppMembers = NOBODY, miniAppUrl = SITE, hasSiteAccount = false) => ({
   userId,
   chatId: userId,
-  siteUrl,
+  miniAppUrl,
   webAppMembers,
   hasSiteAccount,
 });
@@ -123,7 +123,7 @@ test('"*" keeps the in-chat callback for a Telegram the site has never seen', ()
   }
   // Only a real `true` counts: a skipped or mistyped lookup closes the Mini App.
   for (const hasSiteAccount of [undefined, null, 1, "true", {}]) {
-    const target = { userId: 42, chatId: 42, siteUrl: SITE, webAppMembers: EVERYONE, hasSiteAccount };
+    const target = { userId: 42, chatId: 42, miniAppUrl: SITE, webAppMembers: EVERYONE, hasSiteAccount };
     assert.deepEqual(quickAnswerButton(target), CALLBACK_OPEN, JSON.stringify(hasSiteAccount));
     assert.equal(quickAnswerOpensWebApp(42, 42, EVERYONE, hasSiteAccount), false, JSON.stringify(hasSiteAccount));
   }
@@ -164,12 +164,12 @@ test("members the site would not accept open nothing", () => {
 test("outside a private chat nobody gets web_app, not the owner and not with \"*\"", () => {
   for (const chatId of [OPERATOR_GROUP, -OWNER, 123456789, 0, Number.NaN]) {
     for (const webAppMembers of [NOBODY, EVERYONE]) {
-      const target = { userId: OWNER, chatId, siteUrl: SITE, webAppMembers, hasSiteAccount: true };
+      const target = { userId: OWNER, chatId, miniAppUrl: SITE, webAppMembers, hasSiteAccount: true };
       assert.deepEqual(quickAnswerButton(target), CALLBACK_OPEN, String(chatId));
     }
   }
   for (const chatId of [OPERATOR_GROUP, -42, 43]) {
-    const target = { userId: 42, chatId, siteUrl: SITE, webAppMembers: ["*", "tg_42"], hasSiteAccount: true };
+    const target = { userId: 42, chatId, miniAppUrl: SITE, webAppMembers: ["*", "tg_42"], hasSiteAccount: true };
     assert.deepEqual(quickAnswerButton(target), CALLBACK_OPEN, String(chatId));
   }
 });
@@ -179,7 +179,7 @@ test("missing SITE_URL falls back to the callback", () => {
   for (const siteUrl of ["", "   ", undefined, null]) {
     assert.equal(quickAnswerWebAppUrl(siteUrl), null, String(siteUrl));
     for (const userId of [OWNER, 42]) {
-      const target = { userId, chatId: userId, siteUrl, webAppMembers: EVERYONE, hasSiteAccount: true };
+      const target = { userId, chatId: userId, miniAppUrl: siteUrl, webAppMembers: EVERYONE, hasSiteAccount: true };
       assert.deepEqual(quickAnswerButton(target), CALLBACK_OPEN, `${userId} ${String(siteUrl)}`);
     }
   }
@@ -220,7 +220,7 @@ test("malformed user ids never open the Mini App, even with \"*\" and an account
   for (const userId of [0, -1, -OWNER, Number.NaN, Number.POSITIVE_INFINITY, OWNER + 0.5, String(OWNER), null, undefined]) {
     assert.equal(quickAnswerWebAppAccess(userId, userId, members), "callback", String(userId));
     assert.equal(quickAnswerOpensWebApp(userId, userId, members, true), false, String(userId));
-    const target = { userId, chatId: userId, siteUrl: SITE, webAppMembers: members, hasSiteAccount: true };
+    const target = { userId, chatId: userId, miniAppUrl: SITE, webAppMembers: members, hasSiteAccount: true };
     assert.deepEqual(quickAnswerButton(target), CALLBACK_OPEN, String(userId));
   }
 });
@@ -235,7 +235,7 @@ test("a button carries exactly one action", () => {
   ]) {
     const button = quickAnswerButton(target);
     const actions = ["callback_data", "web_app", "url"].filter((key) => key in button);
-    assert.equal(actions.length, 1, `${target.userId} (${target.siteUrl})`);
+    assert.equal(actions.length, 1, `${target.userId} (${target.miniAppUrl})`);
   }
 });
 
